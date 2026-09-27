@@ -1,0 +1,912 @@
+import { createServer } from 'node:http';
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
+import { resolve, relative, isAbsolute, extname } from 'node:path';
+import { URL } from 'node:url';
+import { hashPassword, verifyPassword } from './database.js';
+import { OfficeParser } from 'officeparser';
+
+const COOKIE = 'statlearn_session';
+const SESSION_DAYS = 7;
+const MAX_BODY_BYTES = 1024 * 1024;
+const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+const MAX_DOCUMENT_TEXT = 500_000;
+const MIN_TOKEN_LENGTH = 2;
+const STOP_WORDS = new Set(['the','and','for','with','that','this','from','what','how','which','when','where','does','should','could','would','about','into','have','has','are','was','were','can','you','your','use','using','official','statistics','statistical','data','tell','me','please']);
+const toHash = value => createHash('sha256').update(value).digest('hex');
+const safeEqual = (a, b) => { const aa = Buffer.from(a); const bb = Buffer.from(b); return aa.length === bb.length && timingSafeEqual(aa, bb); };
+const json = (res, status, payload, headers = {}) => { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', ...headers }); res.end(JSON.stringify(payload)); };
+const err = (status, message) => Object.assign(new Error(message), { status });
+
+function parseCookies(header = '') {
+  return Object.fromEntries(header.split(';').map(part => part.trim()).filter(Boolean).map(part => {
+    const split = part.indexOf('=');
+    return [part.slice(0, split), decodeURIComponent(part.slice(split + 1))];
+  }));
+}
+
+async function readBody(req, limit = MAX_BODY_BYTES) {
+  let size = 0;
+  const chunks = [];
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > limit) throw err(413, 'Request body is too large.');
+    chunks.push(chunk);
+  }
+  if (!size) return {};
+  try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); }
+  catch { throw err(400, 'Request body must be valid JSON.'); }
+}
+
+async function readRawBody(req, limit = MAX_UPLOAD_BYTES) {
+  let size=0;const chunks=[];
+  for await(const chunk of req){size+=chunk.length;if(size>limit)throw err(413,'Document exceeds the 10 MB upload limit.');chunks.push(chunk);}
+  if(!size)throw err(400,'The uploaded document is empty.');
+  return Buffer.concat(chunks);
+}
+
+async function currentUser(db, req) {
+  const token = parseCookies(req.headers.cookie)[COOKIE];
+  if (!token || token.length < 40) return null;
+  return (await db.prepare(`SELECT u.id,u.name,u.email,r.name AS role,u.department_id,d.name AS department,
+      u.organization_id,o.name AS organization,u.job_role_id,j.name AS job_role,u.designation,
+      u.experience_years,u.education,u.career_goals,u.languages,u.previous_training,u.certifications,
+      u.current_assignment,u.is_synthetic
+    FROM sessions s JOIN users u ON u.id=s.user_id JOIN roles r ON r.id=u.role_id
+    LEFT JOIN departments d ON d.id=u.department_id LEFT JOIN organizations o ON o.id=u.organization_id
+    LEFT JOIN job_roles j ON j.id=u.job_role_id
+    WHERE s.token_hash=? AND s.expires_at>? AND u.deleted_at IS NULL`).get(toHash(token), new Date().toISOString())) ?? null;
+}
+
+function checkOrigin(req) {
+  const origin = req.headers.origin;
+  if (!origin) return;
+  const allowed = new Set([
+    process.env.APP_ORIGIN,
+    'http://localhost:5173',
+    'http://127.0.0.1:5173',
+    'http://localhost:3000',
+    'http://127.0.0.1:3000',
+    'http://localhost:3001',
+    'http://127.0.0.1:3001',
+  ].filter(Boolean));
+  if (!allowed.has(origin)) throw err(403, 'Request origin is not allowed.');
+}
+
+async function audit(db, userId, action, entityType, entityId = null, detail = {}) {
+  await db.prepare('INSERT INTO audit_logs(user_id,action,entity_type,entity_id,detail_json) VALUES (?,?,?,?,?)')
+    .run(userId, action, entityType, entityId == null ? null : String(entityId), JSON.stringify(detail));
+}
+
+async function notifyUser(db,userId,title,message,kind) {
+  await db.prepare('INSERT INTO notifications(user_id,title,message,kind) VALUES (?,?,?,?)').run(userId,title,message,kind);
+}
+
+async function profileOf(db, userId) {
+  return db.prepare(`SELECT u.id,u.name,u.email,r.name role,d.name department,o.name organization,
+      j.name jobRole,u.designation,u.experience_years experienceYears,u.education,u.career_goals careerGoals,
+      u.languages,u.previous_training previousTraining,u.certifications,u.current_assignment currentAssignment,
+      u.is_synthetic isSynthetic
+    FROM users u JOIN roles r ON r.id=u.role_id LEFT JOIN departments d ON d.id=u.department_id
+    LEFT JOIN organizations o ON o.id=u.organization_id LEFT JOIN job_roles j ON j.id=u.job_role_id WHERE u.id=?`).get(userId);
+}
+
+async function competenciesOf(db, userId) {
+  const rows = await db.prepare(`SELECT c.id,c.name,c.description,cat.name category,
+      COALESCE(uc.self_level,0) selfLevel, COALESCE(uc.current_level,0) currentLevel,
+      COALESCE(uc.confidence,0) confidence, jrc.required_level requiredLevel,jrc.priority,
+      COALESCE(jrc.required_level,0)-COALESCE(uc.current_level,0) gap
+    FROM competencies c JOIN competency_categories cat ON cat.id=c.category_id
+    LEFT JOIN user_competencies uc ON uc.competency_id=c.id AND uc.user_id=?
+    LEFT JOIN users u ON u.id=? LEFT JOIN job_role_competencies jrc ON jrc.competency_id=c.id AND jrc.job_role_id=u.job_role_id
+    WHERE c.active=1 ORDER BY cat.id,c.name`).all(userId, userId);
+  return rows.map(row => ({
+      ...row,
+      gap: Math.max(0, row.gap),
+      priority: row.gap <= 0 ? 'No gap' : row.priority,
+    }));
+}
+
+async function saveGaps(db, userId) {
+  const now = new Date().toISOString();
+  const user = await db.prepare('SELECT job_role_id FROM users WHERE id=?').get(userId);
+  if (!user?.job_role_id) return;
+  const competencies = await db.prepare(`SELECT c.id, COALESCE(uc.current_level,0) current_level,j.required_level,j.priority
+    FROM job_role_competencies j JOIN competencies c ON c.id=j.competency_id
+    LEFT JOIN user_competencies uc ON uc.user_id=? AND uc.competency_id=c.id WHERE j.job_role_id=?`).all(userId, user.job_role_id);
+  const upsert = db.prepare(`INSERT INTO skill_gaps(user_id,competency_id,current_level,required_level,gap,priority,updated_at)
+    VALUES (?,?,?,?,?,?,?) ON CONFLICT(user_id,competency_id) DO UPDATE SET current_level=excluded.current_level,
+    required_level=excluded.required_level,gap=excluded.gap,priority=excluded.priority,updated_at=excluded.updated_at`);
+  const remove = db.prepare('DELETE FROM skill_gaps WHERE user_id=?');
+  await remove.run(userId);
+  for (const row of competencies) {
+    const gap = Math.max(0, row.required_level - row.current_level);
+    if (gap > 0) await upsert.run(userId, row.id, row.current_level, row.required_level, gap, gap >= 4 ? 'Critical' : gap === 3 ? 'High' : gap === 2 ? 'Medium' : 'Low', now);
+  }
+}
+
+function classifyGap(gap) {
+  if (gap <= 0) return 'No gap';
+  if (gap === 1) return 'Low';
+  if (gap === 2) return 'Medium';
+  if (gap === 3) return 'High';
+  return 'Critical';
+}
+
+async function recommendationList(db, userId) {
+  const comps = await competenciesOf(db, userId);
+  const gapById = new Map(comps.map(c => [c.id, c]));
+  const courseRows = await db.prepare(`SELECT c.*, cc.competency_id,cc.target_level,co.name competency_name,
+      coalesce(p.status,'') progress_status,coalesce(p.progress_percent,0) progress_percent
+    FROM courses c JOIN course_competencies cc ON cc.course_id=c.id JOIN competencies co ON co.id=cc.competency_id
+    LEFT JOIN user_course_progress p ON p.course_id=c.id AND p.user_id=? WHERE c.active=1 ORDER BY c.id`).all(userId);
+  const grouped = new Map();
+  const prerequisites = await db.prepare('SELECT course_id,prerequisite_course_id FROM course_prerequisites').all();
+  const unmetByCourse = new Map();
+  for (const pr of prerequisites) {
+    const state = await db.prepare('SELECT status FROM user_course_progress WHERE user_id=? AND course_id=?').get(userId, pr.prerequisite_course_id);
+    if (state?.status !== 'completed') unmetByCourse.set(pr.course_id, [...(unmetByCourse.get(pr.course_id) ?? []), pr.prerequisite_course_id]);
+  }
+  const profile = await profileOf(db, userId);
+  const goals = (profile?.careerGoals ?? '').toLowerCase();
+  for (const row of courseRows) {
+    if (!grouped.has(row.id)) grouped.set(row.id, { id: row.id, title: row.title, summary: row.description, provider: row.provider, providerType: row.provider_type, hours: row.duration_hours, difficulty: row.difficulty, language: row.language, isSynthetic: Boolean(row.is_synthetic), progressStatus: row.progress_status, progressPercent: row.progress_percent, competencies: [], _gaps: [], _score: 0, _reasons: [] });
+    const course = grouped.get(row.id);
+    const comp = gapById.get(row.competency_id);
+    course.competencies.push({ id: row.competency_id, name: row.competency_name, targetLevel: row.target_level, currentLevel: comp?.currentLevel ?? 0, requiredLevel: comp?.requiredLevel ?? 0, gap: comp?.gap ?? 0 });
+    if ((comp?.gap ?? 0) > 0) {
+      const gapScore = Math.min(1, comp.gap / 4) * 0.30;
+      const roleScore = ((comp.requiredLevel ?? 0) / 5) * 0.25;
+      const semanticScore = (goals && goals.includes(row.competency_name.toLowerCase()) ? 1 : 0.55) * 0.20;
+      const historyScore = row.progress_status === 'completed' ? 0 : row.progress_status === 'in_progress' ? 0.3 : 1;
+      const difficultyScore = row.difficulty === 'Beginner' ? 0.95 : 0.68;
+      const prerequisiteScore = unmetByCourse.has(row.id) ? 0.4 : 1;
+      const priorityScore = comp.priority === 'Critical' ? 1 : comp.priority === 'High' ? 0.85 : comp.priority === 'Medium' ? 0.65 : 0.45;
+      course._score += gapScore + roleScore + semanticScore + historyScore * 0.10 + difficultyScore * 0.05 + prerequisiteScore * 0.05 + priorityScore * 0.05;
+      course._gaps.push(comp.name);
+    }
+  }
+  const selected = [...grouped.values()].filter(c => c._gaps.length && c.progressStatus !== 'completed').map(c => {
+    const relevant = [...new Set(c._gaps)];
+    c.score = Math.round(c._score * 100) / 100;
+    c.explanation = `Addresses ${relevant.join(' and ')} gap${relevant.length > 1 ? 's' : ''}; mapped to the ${profile?.jobRole ?? 'selected'} role and prioritised by current level and learning history.`;
+    if (unmetByCourse.has(c.id)) c.explanation += ' A prerequisite is recommended first.';
+    c.gapLabels = relevant.map(name => classifyGap(gapById.get(comps.find(x => x.name === name)?.id)?.gap ?? 0));
+    delete c._score; delete c._gaps;
+    return c;
+  }).sort((a,b) => b.score-a.score || a.hours-b.hours);
+  const byId=new Map(selected.map(course=>[course.id,course]));
+  const visited=new Set(),visiting=new Set(),ordered=[];
+  const addWithPrerequisites=course=>{
+    if(visited.has(course.id)||visiting.has(course.id))return;
+    visiting.add(course.id);
+    for(const prerequisiteId of unmetByCourse.get(course.id)??[]){
+      let prerequisite=byId.get(prerequisiteId);
+      if(!prerequisite){
+        const raw=grouped.get(prerequisiteId);
+        if(raw){
+          const relevant=[...new Set(raw._gaps)];
+          prerequisite={...raw,score:course.score+0.01,explanation:`Complete this prerequisite before “${course.title}” to prepare for ${profile?.jobRole??'your role'}.`,gapLabels:relevant.map(name=>classifyGap(gapById.get(comps.find(x=>x.name===name)?.id)?.gap??0))};
+          delete prerequisite._score;delete prerequisite._gaps;byId.set(prerequisiteId,prerequisite);
+        }
+      }
+      if(prerequisite)addWithPrerequisites(prerequisite);
+    }
+    visiting.delete(course.id);visited.add(course.id);ordered.push(course);
+  };
+  for(const course of selected)addWithPrerequisites(course);
+  await db.prepare('DELETE FROM recommendations WHERE user_id=?').run(userId);
+  const save = db.prepare('INSERT INTO recommendations(user_id,course_id,score,explanation) VALUES (?,?,?,?)');
+  for (const c of ordered) await save.run(userId,c.id,c.score,c.explanation);
+  return ordered;
+}
+
+function tokenize(value) {
+  return [...new Set(String(value).toLowerCase().match(/[a-z0-9]+/g) ?? [])].filter(t => t.length >= MIN_TOKEN_LENGTH && !STOP_WORDS.has(t));
+}
+
+function cosineSimilarity(a,b) {
+  if(!Array.isArray(a)||!Array.isArray(b)||a.length!==b.length||!a.length)return 0;
+  let dot=0,aa=0,bb=0;
+  for(let i=0;i<a.length;i++){dot+=a[i]*b[i];aa+=a[i]*a[i];bb+=b[i]*b[i];}
+  return aa&&bb?dot/(Math.sqrt(aa)*Math.sqrt(bb)):0;
+}
+
+async function embedBatch(texts) {
+  const provider=(process.env.AI_PROVIDER||'demo').toLowerCase();
+  const baseUrl=process.env.AI_BASE_URL;
+  const model=process.env.AI_EMBEDDING_MODEL;
+  if(provider==='demo'||!baseUrl||!model)return [];
+  try {
+    const isOllama=provider==='ollama';
+    const headers={'content-type':'application/json'};
+    if(process.env.AI_API_KEY)headers.authorization=`Bearer ${process.env.AI_API_KEY}`;
+    const response=await fetch(isOllama?`${baseUrl.replace(/\/$/,'')}/api/embed`:`${baseUrl.replace(/\/$/,'')}/embeddings`,{
+      method:'POST',headers,signal:AbortSignal.timeout(12000),body:JSON.stringify({model,input:texts}),
+    });
+    if(!response.ok)return [];
+    const payload=await response.json();
+    const vectors=isOllama?payload.embeddings:payload.data?.map(item=>item.embedding);
+    return Array.isArray(vectors)?vectors.map(vector=>Array.isArray(vector)&&vector.every(Number.isFinite)?vector:null):[];
+  } catch { return []; }
+}
+
+async function embedText(text) {return (await embedBatch([text]))[0]??null;}
+
+async function retrieve(db, question, limit = 3) {
+  const terms = tokenize(question);
+  if (!terms.length) return [];
+  const rows = await db.prepare(`SELECT r.id,r.title,r.source,r.language,ch.page_reference pageReference,ch.content,c.name competency,ch.embedding_json
+    FROM learning_resource_chunks ch JOIN learning_resources r ON r.id=ch.resource_id JOIN competencies c ON c.id=r.competency_id`).all();
+  const queryEmbedding=await embedText(question);
+  const vectorHits=queryEmbedding?rows.filter(r=>r.embedding_json).map(r=>({...r,score:cosineSimilarity(queryEmbedding,JSON.parse(r.embedding_json))})).sort((a,b)=>b.score-a.score):[];
+  if(vectorHits.length)return vectorHits.filter(r=>r.score>=0.18).slice(0,limit).map(({embedding_json,...r})=>r);
+  const lexical=rows.map(r => {
+    const contentTokens = tokenize(`${r.title} ${r.competency} ${r.content}`);
+    const set = new Set(contentTokens);
+    const overlap = terms.reduce((n, term) => n + (set.has(term) ? 1 : 0), 0);
+    const phraseBonus = String(question).toLowerCase().includes(r.competency.toLowerCase()) ? 0.5 : 0;
+    const score = overlap / Math.max(terms.length, 1) + phraseBonus;
+    return { ...r, score };
+  }).filter(r => r.score >= 0.25).sort((a,b) => b.score-a.score);
+  const unique=[];const seen=new Set();
+  for(const row of lexical){if(seen.has(row.id))continue;seen.add(row.id);const {embedding_json,...clean}=row;unique.push(clean);if(unique.length>=limit)break;}
+  return unique;
+}
+
+function excerptFor(resource, query) {
+  const sentences = resource.content.match(/[^.!?]+[.!?]?/g) ?? [resource.content];
+  const queryTerms = new Set(tokenize(query));
+  const scored = sentences.map(sentence => ({ sentence: sentence.trim(), score: tokenize(sentence).reduce((n,t) => n + Number(queryTerms.has(t)), 0) }));
+  return scored.sort((a,b) => b.score-a.score).slice(0, 2).map(s => s.sentence).filter(Boolean).join(' ');
+}
+
+async function generateGroundedAnswer(query, resources) {
+  if (!resources.length) return { answer: 'I could not find this information in the available learning sources.', provider: 'grounded-demo' };
+  const provider = (process.env.AI_PROVIDER || 'demo').toLowerCase();
+  const baseUrl = process.env.AI_BASE_URL;
+  const model = process.env.AI_MODEL;
+  if (provider !== 'demo' && baseUrl && model) {
+    const context = resources.map(r => `[${r.title}, ${r.pageReference}] ${r.content}`).join('\n\n');
+    try {
+      const isOllama = provider === 'ollama';
+      const url = isOllama ? `${baseUrl.replace(/\/$/,'')}/api/chat` : `${baseUrl.replace(/\/$/,'')}/chat/completions`;
+      const headers = { 'content-type': 'application/json' };
+      if (process.env.AI_API_KEY) headers.authorization = `Bearer ${process.env.AI_API_KEY}`;
+      const response = await fetch(url, { method: 'POST', headers, signal: AbortSignal.timeout(12000), body: JSON.stringify(isOllama ? {
+        model, stream: false, messages: [{ role: 'system', content: 'Answer only using the provided learning sources. If they do not contain the answer, say exactly: I could not find this information in the available learning sources.' }, { role: 'user', content: `Sources:\n${context}\n\nQuestion: ${query}` }]
+      } : {
+        model, temperature: 0.1, messages: [{ role: 'system', content: 'Answer only using the provided learning sources. If they do not contain the answer, say exactly: I could not find this information in the available learning sources.' }, { role: 'user', content: `Sources:\n${context}\n\nQuestion: ${query}` }]
+      }) });
+      if (!response.ok) throw new Error(`AI provider returned ${response.status}`);
+      const body = await response.json();
+      const answer = isOllama ? body.message?.content : body.choices?.[0]?.message?.content;
+      if (typeof answer === 'string' && answer.trim()) return { answer: answer.trim(), provider };
+    } catch {
+      // The answer below is still grounded in the retrieved demo corpus and the mode is reported.
+    }
+  }
+  const excerpts = resources.slice(0,2).map(r => excerptFor(r,query)).filter(Boolean);
+  return { answer: `From the available learning material: ${excerpts.join(' ')}`, provider: provider === 'demo' ? 'grounded-demo' : 'grounded-demo-fallback' };
+}
+
+async function dashboard(db, userId) {
+  await saveGaps(db,userId);
+  const user = await profileOf(db, userId);
+  const competencies = await competenciesOf(db, userId);
+  const evaluated = competencies.filter(c => c.requiredLevel != null);
+  const readiness = evaluated.length ? Math.round(evaluated.reduce((sum,c) => sum + Math.min(1,c.currentLevel/Math.max(c.requiredLevel,1)),0)/evaluated.length*100) : 0;
+  const gaps = evaluated.filter(c => c.gap > 0).sort((a,b) => b.gap-a.gap);
+  const progress = await db.prepare('SELECT COUNT(*) total,SUM(CASE WHEN status=\'completed\' THEN 1 ELSE 0 END) completed,COALESCE(SUM(CASE WHEN status=\'completed\' THEN c.duration_hours ELSE 0 END),0) hours FROM user_course_progress p JOIN courses c ON c.id=p.course_id WHERE p.user_id=?').get(userId);
+  const latest = await db.prepare('SELECT score,total_questions,submitted_at FROM assessment_attempts WHERE user_id=? AND status=\'submitted\' ORDER BY submitted_at DESC LIMIT 1').get(userId);
+  const activity = await db.prepare('SELECT action,entity_type,created_at FROM audit_logs WHERE user_id=? ORDER BY created_at DESC,id DESC LIMIT 5').all(userId);
+  const recommendations = (await recommendationList(db,userId)).slice(0,3);
+  return { user, readiness, gapCount:gaps.length, criticalCount:gaps.filter(g=>g.gap>=4).length, learningHours:progress.hours ?? 0, enrolledCount:progress.total ?? 0, completedCount:progress.completed ?? 0, latestAssessment:latest ? {score:latest.score,total:latest.total_questions,submittedAt:latest.submitted_at} : null, competencies, priorityGaps:gaps.slice(0,4).map(c=>({...c,gapLabel:classifyGap(c.gap)})), recommendations, activity, synthetic:Boolean(user?.isSynthetic) };
+}
+
+function requireRole(user, roles) {
+  if (!roles.includes(user.role)) throw err(403, 'Your role cannot access this feature.');
+}
+
+function questionLevel(percent) {
+  if (percent >= 90) return 5;
+  if (percent >= 80) return 4;
+  if (percent >= 65) return 3;
+  if (percent >= 50) return 2;
+  if (percent >= 30) return 1;
+  return 0;
+}
+
+function publicQuestion(row) {
+  return { id:row.id, competencyId:row.competency_id, competency:row.competency_name, question:row.question, options:JSON.parse(row.options_json) };
+}
+
+function fallbackDocumentChunks(text, size=1200, overlap=180) {
+  const chunks=[];let start=0;
+  while(start<text.length&&chunks.length<500){
+    let end=Math.min(text.length,start+size);
+    if(end<text.length){const boundary=text.lastIndexOf(' ',end);if(boundary>start+size*.65)end=boundary;}
+    const value=text.slice(start,end).trim();if(value)chunks.push({text:value,metadata:{}});
+    if(end>=text.length)break;start=Math.max(start+1,end-overlap);
+  }
+  return chunks;
+}
+
+function isValidGeneratedQuestion(item) {
+  return item&&typeof item.question==='string'&&item.question.trim().length>=12&&item.question.length<=600&&
+    Array.isArray(item.options)&&item.options.length>=2&&item.options.length<=5&&
+    item.options.every(option=>typeof option==='string'&&option.trim().length>0&&option.length<=250)&&
+    new Set(item.options.map(option=>option.trim().toLowerCase())).size===item.options.length&&
+    Number.isInteger(item.correctIndex)&&item.correctIndex>=0&&item.correctIndex<item.options.length&&
+    typeof item.explanation==='string'&&item.explanation.trim().length>=8;
+}
+
+async function generateQuestionFromSource(db, competencyId) {
+  const competency=await db.prepare('SELECT id,name FROM competencies WHERE id=? AND active=1').get(competencyId);
+  if(!competency)throw err(404,'Competency was not found.');
+  const source=await db.prepare(`SELECT r.id resource_id,r.title,r.page_reference,ch.page_reference chunk_page,ch.content
+    FROM learning_resources r JOIN learning_resource_chunks ch ON ch.resource_id=r.id
+    WHERE r.competency_id=? ORDER BY r.is_synthetic,r.id,ch.chunk_index LIMIT 1`).get(competencyId);
+  if(!source)throw err(422,'Add a learning source for this competency before generating a question.');
+  const text=source.content.split(/(?<=[.!?])\s+/).map(sentence=>sentence.trim()).find(sentence=>sentence.length>=32)??source.content.slice(0,240).trim();
+  const provider=(process.env.AI_PROVIDER||'demo').toLowerCase();
+  let item=null;
+  if(provider!=='demo'&&process.env.AI_BASE_URL&&process.env.AI_MODEL){
+    try{
+      const isOllama=provider==='ollama';const base=process.env.AI_BASE_URL.replace(/\/$/,'');const headers={'content-type':'application/json'};
+      if(process.env.AI_API_KEY)headers.authorization=`Bearer ${process.env.AI_API_KEY}`;
+      const prompt=`Create exactly one source-grounded multiple-choice assessment question. Return JSON only with question, options (2-5 unique strings), correctIndex (zero-based integer), explanation. Competency: ${competency.name}. Source: ${source.title} page ${source.chunk_page}. Text: ${text}`;
+      const response=await fetch(isOllama?`${base}/api/chat`:`${base}/chat/completions`,{method:'POST',headers,signal:AbortSignal.timeout(12000),body:JSON.stringify(isOllama?{model:process.env.AI_MODEL,stream:false,format:'json',messages:[{role:'user',content:prompt}]}:{model:process.env.AI_MODEL,temperature:0.1,response_format:{type:'json_object'},messages:[{role:'user',content:prompt}]})});
+      if(response.ok){const data=await response.json();const content=isOllama?data.message?.content:data.choices?.[0]?.message?.content;item=JSON.parse(content);}
+    }catch{}
+  }
+  if(!isValidGeneratedQuestion(item)){
+    item={question:`According to “${source.title}”, which statement supports ${competency.name.toLowerCase()}?`,options:[text.slice(0,240),'Keep the method undocumented and skip validation.','Assume all units and results are interchangeable.','Make decisions without checking the available evidence.'],correctIndex:0,explanation:`The cited source states: ${text.slice(0,420)}`};
+  }
+  const normalized=item.question.toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+  const duplicates=(await db.prepare('SELECT question FROM assessment_questions WHERE competency_id=?').all(competencyId)).some(row=>row.question.toLowerCase().replace(/[^a-z0-9]+/g,' ').trim()===normalized);
+  if(duplicates)throw err(409,'A matching question already exists. Add another source or draft a different question.');
+  return {item,source,competency,provider:provider==='demo'?'grounded-demo':provider};
+}
+
+async function analytics(db) {
+  for (const row of await db.prepare('SELECT id FROM users WHERE deleted_at IS NULL').all()) await saveGaps(db,row.id);
+  const summary = await db.prepare(`SELECT
+      (SELECT COUNT(*) FROM users WHERE deleted_at IS NULL) officials,
+      (SELECT COUNT(DISTINCT p.user_id) FROM user_course_progress p JOIN users u ON u.id=p.user_id WHERE p.status='in_progress' AND u.deleted_at IS NULL) activeLearners,
+      (SELECT COALESCE(AVG(a.score),0) FROM assessment_attempts a JOIN users u ON u.id=a.user_id WHERE a.status='submitted' AND u.deleted_at IS NULL) averageAssessment`).get();
+  const departments = await db.prepare(`SELECT d.name department,COUNT(DISTINCT u.id) officials,COUNT(DISTINCT CASE WHEN p.status='completed' THEN p.user_id END) learnersCompleted
+    FROM departments d LEFT JOIN users u ON u.department_id=d.id AND u.deleted_at IS NULL LEFT JOIN user_course_progress p ON p.user_id=u.id GROUP BY d.id ORDER BY d.name`).all();
+  const gaps = await db.prepare(`SELECT c.name competency,COUNT(*) officials,SUM(g.gap) gapPoints,MAX(g.gap) maxGap
+    FROM skill_gaps g JOIN competencies c ON c.id=g.competency_id JOIN users u ON u.id=g.user_id
+    WHERE u.deleted_at IS NULL GROUP BY c.id ORDER BY gapPoints DESC,c.name LIMIT 8`).all();
+  const courseEffectiveness = await db.prepare(`SELECT c.title course,COUNT(p.id) enrollments,
+      SUM(CASE WHEN p.status='completed' THEN 1 ELSE 0 END) completions,
+      ROUND(CASE WHEN COUNT(p.id)=0 THEN 0 ELSE 100.0*SUM(CASE WHEN p.status='completed' THEN 1 ELSE 0 END)/COUNT(p.id) END,1) completionRate
+    FROM courses c LEFT JOIN user_course_progress p ON p.course_id=c.id GROUP BY c.id ORDER BY enrollments DESC,c.title LIMIT 6`).all();
+  return { ...summary, departments, topGaps:gaps, courseEffectiveness, synthetic:false, label:'Current platform analytics' };
+}
+
+async function predictiveScenario(db) {
+  const rows=await db.prepare(`SELECT c.id,c.name competency,j.priority,COUNT(DISTINCT u.id) evaluatedLearners,
+      COUNT(DISTINCT CASE WHEN uc.current_level<j.required_level THEN u.id END) learnersBelow,
+      COALESCE(AVG(CASE WHEN u.id IS NOT NULL THEN GREATEST(0,j.required_level-COALESCE(uc.current_level,0)) END),0) averageGap,
+      COUNT(DISTINCT cc.course_id) mappedCourses
+    FROM competencies c JOIN job_role_competencies j ON j.competency_id=c.id
+    LEFT JOIN users u ON u.job_role_id=j.job_role_id AND u.deleted_at IS NULL
+    LEFT JOIN user_competencies uc ON uc.user_id=u.id AND uc.competency_id=c.id
+    LEFT JOIN course_competencies cc ON cc.competency_id=c.id
+    WHERE c.active=1 GROUP BY c.id,j.priority ORDER BY c.name`).all();
+  const items=rows.map(row=>{
+    const evaluated=Number(row.evaluatedLearners)||0;const below=Number(row.learnersBelow)||0;const averageGap=Number(row.averageGap)||0;
+    const shortageRate=evaluated?below/evaluated:0;
+    return {...row,evaluatedLearners:evaluated,learnersBelow:below,averageGap:Math.round(averageGap*100)/100,
+      demandScore:Math.round((shortageRate*.65+averageGap/5*.35)*100),
+      suggestedAction:row.mappedCourses?'Prioritise the mapped learning content.':'Create or source learning content for this skill.'};
+  }).sort((a,b)=>b.demandScore-a.demandScore||b.learnersBelow-a.learnersBelow).slice(0,8);
+  return {mode:'gap-analysis',label:'Current training demand',synthetic:false,
+    method:'Priority scores summarise current competency gaps among registered learners. They are not a forecast.',
+    population:(await db.prepare("SELECT COUNT(*) count FROM users WHERE deleted_at IS NULL AND job_role_id IS NOT NULL").get()).count,
+    generatedAt:new Date().toISOString(),items};
+}
+
+export function createAppServer({ db }) {
+  const loginAttempts = new Map();
+  const rateBuckets = new Map();
+  const server = createServer(async (req,res) => {
+    res.setHeader('x-content-type-options','nosniff');
+    res.setHeader('referrer-policy','same-origin');
+    res.setHeader('x-frame-options','DENY');
+    res.setHeader('cross-origin-resource-policy','same-origin');
+    res.setHeader('content-security-policy',"default-src 'self'; img-src 'self' data:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'");
+    res.setHeader('permissions-policy','camera=(), microphone=(), geolocation=()');
+    const url = new URL(req.url, 'http://localhost');
+    const path = url.pathname;
+    try {
+      if(path.startsWith('/api/')&&['POST','PATCH','PUT','DELETE'].includes(req.method)&&path!=='/api/auth/login'){
+        const policy=path==='/api/auth/register'?{limit:5,window:3600000,key:'register'}:path==='/api/resources/upload'?{limit:12,window:3600000,key:'upload'}:path==='/api/assistant/chat'?{limit:40,window:60000,key:'assistant'}:{limit:120,window:60000,key:'mutations'};
+        const bucketKey=`${req.socket.remoteAddress??'unknown'}:${policy.key}`;const now=Date.now();let bucket=rateBuckets.get(bucketKey);
+        if(!bucket||now-bucket.started>=policy.window)bucket={started:now,count:0};
+        if(bucket.count>=policy.limit)return json(res,429,{error:'Request limit reached. Try again later.'},{'retry-after':String(Math.ceil((bucket.started+policy.window-now)/1000))});
+        bucket.count+=1;rateBuckets.set(bucketKey,bucket);
+        if(rateBuckets.size>5000)for(const [key,value] of rateBuckets)if(now-value.started>3600000)rateBuckets.delete(key);
+      }
+      if (req.method === 'GET' && path === '/api/health') return json(res,200,{status:'ok',app:'StatLearn'});
+      if (req.method === 'GET' && path === '/api/ready') {
+        await db.prepare('SELECT 1').get();
+        return json(res,200,{status:'ready',database:'postgresql'});
+      }
+      if(req.method==='POST'&&path==='/api/auth/register') {
+        checkOrigin(req);
+        const body=await readBody(req);const name=String(body.name??'').trim();const email=String(body.email??'').trim().toLowerCase();const password=String(body.password??'');
+        if(name.length<2||name.length>100)throw err(400,'Name must contain between 2 and 100 characters.');
+        if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||email.length>254)throw err(400,'Enter a valid email address.');
+        if(password.length<10||password.length>128)throw err(400,'Password must contain 10 to 128 characters.');
+        if(await db.prepare('SELECT 1 FROM users WHERE email=?').get(email))throw err(409,'An account with this email already exists.');
+        const departmentId=(await db.prepare('SELECT id FROM departments WHERE name=?').get(process.env.DEFAULT_DEPARTMENT || 'General')).id;
+        const organizationId=(await db.prepare('SELECT id FROM organizations WHERE name=?').get(process.env.DEFAULT_ORGANIZATION || 'My Organization')).id;
+        const jobRoleId=(await db.prepare('SELECT id FROM job_roles WHERE name=?').get(process.env.DEFAULT_JOB_ROLE || 'Statistical Data Analyst')).id;
+        const learnerRoleId=(await db.prepare('SELECT id FROM roles WHERE name=?').get('Learner')).id;
+        const created=await db.prepare(`INSERT INTO users(name,email,password_hash,role_id,department_id,organization_id,job_role_id,designation,career_goals,languages,is_synthetic)
+          VALUES (?,?,?,?,?,?,?,'Official','Build practical skills for high-quality statistical work','English',0)`).run(name,email,hashPassword(password),learnerRoleId,departmentId,organizationId,jobRoleId);
+        const userId=Number(created.lastInsertRowid);
+        await db.prepare('INSERT INTO user_roles(user_id,role_id) VALUES (?,?)').run(userId,learnerRoleId);
+        await db.prepare('INSERT INTO user_competencies(user_id,competency_id,self_level,assessment_level,current_level,confidence) SELECT ?,id,0,NULL,0,0.35 FROM competencies WHERE active=1').run(userId);
+        await saveGaps(db,userId);await audit(db,userId,'account_registered','user',userId,{role:'Learner'});
+        await notifyUser(db,userId,'Welcome to StatLearn','Your learning profile is ready. Review your competencies and start an assessment.','learning');
+        const token=randomBytes(32).toString('base64url');const expires=new Date(Date.now()+SESSION_DAYS*86400000).toISOString();
+        await db.prepare('INSERT INTO sessions(user_id,token_hash,expires_at) VALUES (?,?,?)').run(userId,toHash(token),expires);
+        const secure=process.env.NODE_ENV==='production'?'; Secure':'';
+        return json(res,201,{user:await profileOf(db,userId)},{'set-cookie':`${COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_DAYS*86400}${secure}`});
+      }
+      if (req.method === 'POST' && path === '/api/auth/login') {
+        checkOrigin(req);
+        const body = await readBody(req);
+        const email = String(body.email ?? '').trim().toLowerCase();
+        const password = String(body.password ?? '');
+        const ip = req.socket.remoteAddress ?? 'unknown';
+        const attempt = loginAttempts.get(ip) ?? { count:0, reset:Date.now()+15*60*1000 };
+        if (Date.now() > attempt.reset) { attempt.count=0; attempt.reset=Date.now()+15*60*1000; }
+        if (attempt.count >= 10) return json(res,429,{error:'Too many sign-in attempts. Try again in 15 minutes.'});
+        const row = await db.prepare('SELECT id,password_hash FROM users WHERE email=? AND deleted_at IS NULL').get(email);
+        if (!row || !verifyPassword(password,row.password_hash)) {
+          attempt.count += 1; loginAttempts.set(ip,attempt);
+          return json(res,401,{error:'Email or password is incorrect.'});
+        }
+        loginAttempts.delete(ip);
+        const token = randomBytes(32).toString('base64url');
+        const expires = new Date(Date.now()+SESSION_DAYS*86400000).toISOString();
+        await db.prepare('INSERT INTO sessions(user_id,token_hash,expires_at) VALUES (?,?,?)').run(row.id,toHash(token),expires);
+        await audit(db,row.id,'login','session');
+        const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
+        return json(res,200,{user:await profileOf(db,row.id)},{'set-cookie':`${COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_DAYS*86400}${secure}`});
+      }
+      if (req.method === 'POST' && path === '/api/auth/logout') {
+        checkOrigin(req);
+        const token = parseCookies(req.headers.cookie)[COOKIE];
+        const user = await currentUser(db,req);
+        if (token) await db.prepare('DELETE FROM sessions WHERE token_hash=?').run(toHash(token));
+        if (user) await audit(db,user.id,'logout','session');
+        return json(res,200,{ok:true},{'set-cookie':`${COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`});
+      }
+
+      const user = await currentUser(db,req);
+      if (path.startsWith('/api/') && !user) return json(res,401,{error:'Sign in to continue.'});
+
+      if (req.method === 'GET' && path === '/api/auth/me') return json(res,200,{user:await profileOf(db,user.id)});
+      if (req.method === 'GET' && path === '/api/dashboard') return json(res,200,await dashboard(db,user.id));
+      if (req.method === 'GET' && path === '/api/profile') return json(res,200,await profileOf(db,user.id));
+      if (req.method === 'PATCH' && path === '/api/profile') {
+        checkOrigin(req);
+        const body = await readBody(req);
+        const allowed = { name:'name',designation:'designation',experienceYears:'experience_years',education:'education',careerGoals:'career_goals',languages:'languages',previousTraining:'previous_training',certifications:'certifications',currentAssignment:'current_assignment' };
+        const updates = Object.entries(allowed).filter(([key]) => body[key] !== undefined);
+        if (!updates.length) throw err(400,'Provide at least one profile field to update.');
+        if (body.name !== undefined && (typeof body.name !== 'string' || body.name.trim().length < 2 || body.name.length > 100)) throw err(400,'Name must contain between 2 and 100 characters.');
+        if (body.experienceYears !== undefined && (!Number.isFinite(Number(body.experienceYears)) || Number(body.experienceYears)<0 || Number(body.experienceYears)>60)) throw err(400,'Experience must be between 0 and 60 years.');
+        for (const [key,column] of updates) await db.prepare(`UPDATE users SET ${column}=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`).run(key==='experienceYears' ? Number(body[key]) : String(body[key]).slice(0,2000),user.id);
+        await audit(db,user.id,'profile_updated','user',user.id,{ fields:updates.map(([key])=>key) });
+        return json(res,200,await profileOf(db,user.id));
+      }
+      if (req.method === 'GET' && path === '/api/competencies') return json(res,200,{items:await competenciesOf(db,user.id),levels:await db.prepare('SELECT level,label FROM competency_levels ORDER BY level').all()});
+      if (req.method === 'PATCH' && /^\/api\/competencies\/\d+$/.test(path)) {
+        checkOrigin(req);
+        const competencyId = Number(path.split('/').at(-1));
+        const body = await readBody(req);
+        const level = Number(body.selfLevel);
+        if (!Number.isInteger(level)||level<0||level>5) throw err(400,'Self-assessed level must be an integer from 0 to 5.');
+        const existing = await db.prepare('SELECT assessment_level FROM user_competencies WHERE user_id=? AND competency_id=?').get(user.id,competencyId);
+        if (!existing) throw err(404,'Competency was not found.');
+        const current = existing.assessment_level == null ? level : Math.round(level*0.4+existing.assessment_level*0.6);
+        await db.prepare('UPDATE user_competencies SET self_level=?,current_level=?,confidence=?,updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND competency_id=?').run(level,current,existing.assessment_level==null?0.45:0.85,user.id,competencyId);
+        await db.prepare('INSERT INTO competency_evidence(user_id,competency_id,source,score,level,confidence,detail) VALUES (?,?,?,?,?,?,?)').run(user.id,competencyId,'self_assessment',level*20,level,0.45,'Self assessment submitted by learner.');
+        await saveGaps(db,user.id); await audit(db,user.id,'competency_updated','competency',competencyId,{source:'self_assessment',level});
+        await notifyUser(db,user.id,'Competency profile updated','Your self-assessment was saved and role skill gaps were recalculated.','skill_gap');
+        return json(res,200,(await competenciesOf(db,user.id)).find(c=>c.id===competencyId));
+      }
+      if (req.method === 'GET' && path === '/api/catalog') return json(res,200,{items:await db.prepare(`SELECT c.id,c.title,c.description summary,c.provider,c.provider_type providerType,c.duration_hours hours,c.difficulty,c.language,c.is_synthetic isSynthetic,
+        STRING_AGG(co.name, ' · ') competencies,COALESCE(p.status,'') progressStatus,COALESCE(p.progress_percent,0) progressPercent
+        FROM courses c JOIN course_competencies cc ON cc.course_id=c.id JOIN competencies co ON co.id=cc.competency_id
+        LEFT JOIN user_course_progress p ON p.course_id=c.id AND p.user_id=? WHERE c.active=1 GROUP BY c.id ORDER BY c.title`).all(user.id)});
+      if (req.method === 'GET' && path === '/api/recommendations') return json(res,200,{items:await recommendationList(db,user.id)});
+      if (req.method === 'GET' && path === '/api/learning/path') {
+        const items = (await recommendationList(db,user.id)).slice(0,5).map((course,index)=>({stage:index+1,...course}));
+        await db.prepare('DELETE FROM learning_path_items WHERE user_id=?').run(user.id);
+        const pathId = randomUUID();
+        await db.prepare('INSERT INTO learning_paths(id,user_id,title,updated_at) VALUES (?,?,?,CURRENT_TIMESTAMP)').run(pathId,user.id,'Personalised competency pathway');
+        const insert = db.prepare('INSERT INTO learning_path_items(path_id,user_id,course_id,stage,status) VALUES (?,?,?,?,?)');
+        for(const item of items) await insert.run(pathId,user.id,item.id,item.stage,item.progressStatus||'recommended');
+        return json(res,200,{title:'Personalised competency pathway',items,updatedAt:new Date().toISOString(),synthetic:false});
+      }
+      if (req.method === 'POST' && /^\/api\/courses\/\d+\/enroll$/.test(path)) {
+        checkOrigin(req);
+        const courseId=Number(path.split('/')[3]);
+        if (!await db.prepare('SELECT 1 FROM courses WHERE id=? AND active=1').get(courseId)) throw err(404,'Course was not found.');
+        await db.prepare(`INSERT INTO user_course_progress(user_id,course_id,status,progress_percent) VALUES (?,?,'in_progress',0)
+          ON CONFLICT(user_id,course_id) DO UPDATE SET status=CASE WHEN status='completed' THEN status ELSE 'in_progress' END`).run(user.id,courseId);
+        await audit(db,user.id,'course_enrolled','course',courseId);
+        await notifyUser(db,user.id,'Learning path updated','A course was added to your learning activity.','learning_path');
+        return json(res,200,{ok:true,courseId});
+      }
+      if (req.method === 'POST' && /^\/api\/courses\/\d+\/complete$/.test(path)) {
+        checkOrigin(req);
+        const courseId=Number(path.split('/')[3]);
+        const course=await db.prepare('SELECT id,title FROM courses WHERE id=? AND active=1').get(courseId);
+        if (!course) throw err(404,'Course was not found.');
+        await db.prepare(`INSERT INTO user_course_progress(user_id,course_id,status,progress_percent,completed_at) VALUES (?,?,'completed',100,CURRENT_TIMESTAMP)
+          ON CONFLICT(user_id,course_id) DO UPDATE SET status='completed',progress_percent=100,completed_at=CURRENT_TIMESTAMP`).run(user.id,courseId);
+        const mapped=await db.prepare('SELECT competency_id,target_level FROM course_competencies WHERE course_id=?').all(courseId);
+        for(const row of mapped) {
+          const old=await db.prepare('SELECT self_level,current_level FROM user_competencies WHERE user_id=? AND competency_id=?').get(user.id,row.competency_id);
+          const updated=Math.max(old.current_level,Math.min(row.target_level,old.current_level+1));
+          await db.prepare('UPDATE user_competencies SET current_level=?,confidence=LEAST(1,confidence+0.1),updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND competency_id=?').run(updated,user.id,row.competency_id);
+          await db.prepare('INSERT INTO competency_evidence(user_id,competency_id,source,score,level,confidence,detail) VALUES (?,?,?,?,?,?,?)').run(user.id,row.competency_id,'course_assessment',updated*20,updated,0.65,`Completed ${course.title}. Completion is self-reported unless verified by a connected provider.`);
+        }
+        await saveGaps(db,user.id); await audit(db,user.id,'course_completed','course',courseId,{title:course.title});
+        await notifyUser(db,user.id,'Course completion recorded',`Your completion of “${course.title}” was recorded. It is self-reported unless confirmed by a connected learning provider.`,'completion');
+        return json(res,200,{ok:true,courseId,competencies:await competenciesOf(db,user.id)});
+      }
+      if (req.method === 'POST' && path === '/api/assessment/start') {
+        checkOrigin(req);
+        const rows=await db.prepare(`SELECT q.id,q.competency_id,c.name competency_name,q.question,q.options_json
+          FROM assessment_questions q JOIN competencies c ON c.id=q.competency_id WHERE q.status='published' ORDER BY q.id`).all();
+        if(rows.length<4) throw err(503,'Assessment question bank is not ready.');
+        const questionIds=rows.map(q=>q.id);
+        const id=randomUUID();
+        await db.prepare('INSERT INTO assessment_attempts(id,user_id,question_ids_json,total_questions) VALUES (?,?,?,?)').run(id,user.id,JSON.stringify(questionIds),questionIds.length);
+        await audit(db,user.id,'assessment_started','assessment',id,{questions:questionIds.length});
+        return json(res,201,{attemptId:id,questions:rows.map(publicQuestion),total:questionIds.length});
+      }
+      if (req.method === 'POST' && /^\/api\/assessment\/[^/]+\/submit$/.test(path)) {
+        checkOrigin(req);
+        const attemptId=path.split('/')[3];
+        const attempt=await db.prepare('SELECT * FROM assessment_attempts WHERE id=? AND user_id=?').get(attemptId,user.id);
+        if(!attempt) throw err(404,'Assessment attempt was not found.');
+        if(attempt.status==='submitted') throw err(409,'This attempt has already been submitted.');
+        const body=await readBody(req);
+        if(!body.answers||typeof body.answers!=='object'||Array.isArray(body.answers)) throw err(400,'Answers must be an object keyed by question id.');
+        const questionIds=JSON.parse(attempt.question_ids_json);
+        const questions=await Promise.all(questionIds.map(id=>db.prepare(`SELECT q.*,c.name competency_name,r.title source_title,r.page_reference FROM assessment_questions q JOIN competencies c ON c.id=q.competency_id LEFT JOIN learning_resources r ON r.id=q.source_id WHERE q.id=?`).get(id)));
+        if(Object.keys(body.answers).length!==questions.length||questions.some(q=>!Number.isInteger(Number(body.answers[q.id])))) throw err(400,'Answer every question before submitting.');
+        let correct=0;
+        const perCompetency=new Map();
+        const answerInsert=db.prepare('INSERT INTO assessment_answers(attempt_id,question_id,selected_index,is_correct) VALUES (?,?,?,?)');
+        const feedback=[];
+        for(const q of questions){
+          const selected=Number(body.answers[q.id]);
+          if(selected<0||selected>=JSON.parse(q.options_json).length) throw err(400,'An answer option is invalid.');
+          const isCorrect=selected===q.correct_index;
+          correct+=Number(isCorrect);
+          const item=perCompetency.get(q.competency_id)??{correct:0,total:0};
+          item.correct+=Number(isCorrect);item.total+=1;perCompetency.set(q.competency_id,item);
+          await answerInsert.run(attemptId,q.id,selected,Number(isCorrect));
+          feedback.push({questionId:q.id,competency:q.competency_name,question:q.question,options:JSON.parse(q.options_json),selectedIndex:selected,correctIndex:q.correct_index,isCorrect,explanation:q.explanation,source:q.source_title?{title:q.source_title,page:q.page_reference}:null});
+        }
+        const score=Math.round(correct/questions.length*100);
+        const updateComp=db.prepare('UPDATE user_competencies SET assessment_level=?,current_level=?,confidence=?,updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND competency_id=?');
+        const evidence=db.prepare('INSERT INTO competency_evidence(user_id,competency_id,source,score,level,confidence,detail) VALUES (?,?,?,?,?,?,?)');
+        for(const [competencyId,result] of perCompetency){
+          const percent=Math.round(result.correct/result.total*100);
+          const level=questionLevel(percent);
+          const row=await db.prepare('SELECT self_level FROM user_competencies WHERE user_id=? AND competency_id=?').get(user.id,competencyId);
+          const current=Math.round(row.self_level*0.4+level*0.6);
+          await updateComp.run(level,current,Math.min(0.95,0.6+result.total*0.1),user.id,competencyId);
+          await evidence.run(user.id,competencyId,'assessment',percent,level,Math.min(0.95,0.6+result.total*0.1),`Assessment evidence: ${result.correct}/${result.total} questions correct.`);
+        }
+        const submittedAt=new Date().toISOString();
+        await db.prepare('UPDATE assessment_attempts SET status=\'submitted\',score=?,submitted_at=? WHERE id=?').run(score,submittedAt,attemptId);
+        await saveGaps(db,user.id);
+        await audit(db,user.id,'assessment_submitted','assessment',attemptId,{score,questionCount:questions.length,competenciesUpdated:perCompetency.size});
+        const updated=await competenciesOf(db,user.id);
+        const recommendations=(await recommendationList(db,user.id)).slice(0,3);
+        await audit(db,user.id,'recommendation_refreshed','recommendation',null,{count:recommendations.length});
+        await notifyUser(db,user.id,'Assessment feedback available',`Your ${score}% assessment result updated competency evidence, skill gaps, and recommendations.`,'assessment');
+        if(updated.some(comp=>comp.gap>0))await notifyUser(db,user.id,'Skill gaps recalculated','Review your updated priority gaps and recommended courses.','skill_gap');
+        return json(res,200,{attemptId,score,correct,total:questions.length,percentage:score,submittedAt,feedback,updatedCompetencies:updated.filter(c=>perCompetency.has(c.id)),recommendations,skillGaps:updated.filter(c=>c.gap>0).sort((a,b)=>b.gap-a.gap).slice(0,6)});
+      }
+      if (req.method === 'GET' && path === '/api/assessment/history') {
+        return json(res,200,{items:await db.prepare(`SELECT id,score,total_questions total,submitted_at submittedAt,created_at createdAt FROM assessment_attempts WHERE user_id=? AND status='submitted' ORDER BY submitted_at DESC LIMIT 20`).all(user.id)});
+      }
+      if (req.method === 'GET' && path === '/api/resources') {
+        return json(res,200,{items:await db.prepare(`SELECT r.id,r.title,r.source,r.language,r.page_reference pageReference,c.name competency,
+          length(r.content) contentLength,r.file_name fileName,r.provider,r.topic,r.is_synthetic isSynthetic,
+          (SELECT COUNT(*) FROM learning_resource_chunks ch WHERE ch.resource_id=r.id) chunkCount
+          FROM learning_resources r JOIN competencies c ON c.id=r.competency_id ORDER BY r.title`).all(),synthetic:false});
+      }
+      if(req.method==='POST'&&path==='/api/resources/upload') {
+        checkOrigin(req);requireRole(user,['Trainer','System Admin']);
+        const rawName=req.headers['x-document-name'];const competencyId=Number(req.headers['x-competency-id']);
+        const language=String(req.headers['x-language']||'English').slice(0,60);
+        if(typeof rawName!=='string'||!rawName)throw err(400,'Choose a document with a file name.');
+        let decodedName;try{decodedName=decodeURIComponent(rawName);}catch{throw err(400,'Document file name is invalid.');}
+        const fileName=decodedName.replace(/[\u0000-\u001f]/g,'').split(/[\\/]/).at(-1).slice(0,140);
+        const extension=extname(fileName).toLowerCase();
+        if(extension==='.ppt')throw err(415,'Legacy .ppt files are not supported. Save the presentation as .pptx and upload it again.');
+        if(!['.pdf','.docx','.pptx','.txt','.md'].includes(extension))throw err(415,'Supported files are PDF, DOCX, PPTX, TXT, and Markdown.');
+        if(!await db.prepare('SELECT 1 FROM competencies WHERE id=? AND active=1').get(competencyId))throw err(400,'Choose a valid competency for this learning material.');
+        const buffer=await readRawBody(req);
+        if(extension==='.pdf'&&!buffer.subarray(0,5).equals(Buffer.from('%PDF-')))throw err(415,'File contents do not match the PDF extension.');
+        if(['.docx','.pptx'].includes(extension)&&!(buffer[0]===0x50&&buffer[1]===0x4b))throw err(415,'File contents do not match the Office document extension.');
+        if(['.txt','.md'].includes(extension)&&buffer.includes(0))throw err(415,'Text files cannot contain binary data.');
+        const fileHash=createHash('sha256').update(buffer).digest('hex');
+        if(await db.prepare('SELECT 1 FROM learning_resources WHERE file_hash=?').get(fileHash))throw err(409,'This document is already in the learning library.');
+        let textContent='';let parsedChunks=[];
+        if(extension==='.txt'||extension==='.md'){
+          try{textContent=new TextDecoder('utf-8',{fatal:true}).decode(buffer);}catch{throw err(415,'Text files must use UTF-8 encoding.');}
+          parsedChunks=fallbackDocumentChunks(textContent);
+        }else{
+          const controller=new AbortController();const timeout=setTimeout(()=>controller.abort(),15000);
+          try{
+            const format=extension.slice(1);
+            const ast=await OfficeParser.parseOffice(buffer,{fileType:format,abortSignal:controller.signal,ocr:false,extractAttachments:false});
+            const parsedText=await ast.to('text',{includeImages:false,textConfig:{preserveLayout:false,renderNotes:false}});
+            textContent=String(parsedText.value??'');
+            const chunkResult=await ast.to('chunks',{chunksConfig:{strategy:'document-structure',splitBy:format==='pdf'?'page':format==='pptx'?'slide':'paragraph',maxChunkSize:1200,addStartIndex:true}});
+            parsedChunks=Array.isArray(chunkResult.value)?chunkResult.value.map((chunk,index)=>({text:String(chunk.text??''),metadata:{...(chunk.metadata??{}),startIndex:chunk.startIndex??index}})).filter(chunk=>chunk.text.trim()):[];
+          }catch(error){
+            if(error.name==='AbortError')throw err(408,'Document parsing exceeded the 15 second limit. Try a smaller file or a text-based version.');
+            throw err(422,'The document could not be parsed. It may be encrypted, damaged, or image-only.');
+          }finally{clearTimeout(timeout);}
+          if(!parsedChunks.length&&textContent.trim())parsedChunks=fallbackDocumentChunks(textContent);
+        }
+        textContent=textContent.replace(/\u0000/g,'').trim();
+        if(!textContent)throw err(422,'No readable text was found. Scanned image-only documents need OCR before upload.');
+        if(textContent.length>MAX_DOCUMENT_TEXT)throw err(413,'Extracted document text exceeds the 500,000 character limit. Split the source into smaller files.');
+        if(parsedChunks.length>500)throw err(413,'Document produced more than 500 chunks. Split the source into smaller files.');
+        const chunks=parsedChunks.slice(0,500).map((chunk,index)=>({
+          index,content:chunk.text.slice(0,5000),pageReference:Number.isInteger(chunk.metadata.pageNumber)?`page ${chunk.metadata.pageNumber}`:Number.isInteger(chunk.metadata.slideNumber)?`slide ${chunk.metadata.slideNumber}`:'document',
+          metadata:chunk.metadata,
+        })).filter(chunk=>chunk.content.trim());
+        if(!chunks.length)throw err(422,'No searchable learning chunks could be created from this document.');
+        let vectors=[];
+        for(let i=0;i<chunks.length;i+=32){
+          const batch=await embedBatch(chunks.slice(i,i+32).map(chunk=>chunk.content));
+          if(!batch.length)break;vectors.push(...batch);
+        }
+        const competency=await db.prepare('SELECT name FROM competencies WHERE id=?').get(competencyId);
+        const title=`${fileName} · ${fileHash.slice(0,8)}`;
+        let resourceId;
+        await db.transaction(async tx=>{
+          const saved=await tx.prepare(`INSERT INTO learning_resources(title,source,competency_id,language,page_reference,content,is_synthetic,file_name,file_hash,uploaded_by,provider,topic)
+            VALUES (?,?,?,?,?,?,0,?,?,?,?,?)`).run(title,`Uploaded learning material · ${fileName}`,competencyId,language,'document',textContent,fileName,fileHash,user.id,'Internal upload',competency.name);
+          resourceId=Number(saved.lastInsertRowid);
+          const insertChunk=tx.prepare('INSERT INTO learning_resource_chunks(resource_id,chunk_index,content,page_reference,metadata_json,embedding_json) VALUES (?,?,?,?,?,?)');
+          for(let i=0;i<chunks.length;i++)await insertChunk.run(resourceId,chunks[i].index,chunks[i].content,chunks[i].pageReference,JSON.stringify(chunks[i].metadata),vectors[i]?JSON.stringify(vectors[i]):null);
+        });
+        await audit(db,user.id,'learning_resource_uploaded','learning_resource',resourceId,{fileName,extension,chunkCount:chunks.length,competency:competency.name});
+        return json(res,201,{id:resourceId,title:fileName,competency:competency.name,chunkCount:chunks.length,textLength:textContent.length,provider:'Internal upload',synthetic:false,embedded:vectors.length===chunks.length});
+      }
+      if (req.method === 'POST' && path === '/api/assistant/chat') {
+        checkOrigin(req);
+        const body=await readBody(req);
+        const query=String(body.message??'').trim();
+        if(query.length<2||query.length>1200) throw err(400,'Message must contain 2 to 1,200 characters.');
+        const hits=await retrieve(db,query);
+        const result=await generateGroundedAnswer(query,hits);
+        const sessionId=String(body.sessionId??'')||randomUUID();
+        if(!await db.prepare('SELECT 1 FROM chat_sessions WHERE id=? AND user_id=?').get(sessionId,user.id)) await db.prepare('INSERT INTO chat_sessions(id,user_id,title) VALUES (?,?,?)').run(sessionId,user.id,query.slice(0,80));
+        await db.prepare('INSERT INTO chat_messages(session_id,role,content,sources_json) VALUES (?,?,?,?)').run(sessionId,'user',query,'[]');
+        const sources=hits.map(r=>({title:r.title,source:r.source,competency:r.competency,page:r.pageReference,score:Math.round(r.score*100)/100}));
+        await db.prepare('INSERT INTO chat_messages(session_id,role,content,sources_json) VALUES (?,?,?,?)').run(sessionId,'assistant',result.answer,JSON.stringify(sources));
+        await audit(db,user.id,'ai_question','chat_session',sessionId,{provider:result.provider,sourceCount:sources.length});
+        return json(res,200,{sessionId,answer:result.answer,sources,provider:result.provider,grounded:sources.length>0});
+      }
+      if(req.method==='GET'&&path==='/api/notifications') return json(res,200,{items:await db.prepare('SELECT id,title,message,kind,read_at readAt,created_at createdAt FROM notifications WHERE user_id=? ORDER BY CASE WHEN read_at IS NULL THEN 0 ELSE 1 END,created_at DESC LIMIT 10').all(user.id)});
+      if(req.method==='PATCH'&&/^\/api\/notifications\/\d+\/read$/.test(path)){
+        checkOrigin(req);const notificationId=Number(path.split('/')[3]);
+        const changed=await db.prepare('UPDATE notifications SET read_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?').run(notificationId,user.id);
+        if(!changed.changes)throw err(404,'Notification was not found.');
+        return json(res,200,{ok:true,id:notificationId});
+      }
+      if(req.method==='GET'&&path==='/api/trainer/dashboard') {
+        requireRole(user,['Trainer','System Admin']);
+        return json(res,200,{draftQuestions:(await db.prepare("SELECT COUNT(*) count FROM assessment_questions WHERE status='draft'").get()).count,learners:(await db.prepare("SELECT COUNT(*) count FROM users WHERE role_id=(SELECT id FROM roles WHERE name='Learner') AND deleted_at IS NULL").get()).count,assessments:(await db.prepare("SELECT COUNT(*) count FROM assessment_attempts WHERE status='submitted'").get()).count,questions:await db.prepare('SELECT q.id,q.question,q.status,c.name competency FROM assessment_questions q JOIN competencies c ON c.id=q.competency_id ORDER BY q.created_at DESC LIMIT 12').all(),synthetic:false});
+      }
+      if(req.method==='POST'&&path==='/api/trainer/questions') {
+        checkOrigin(req);requireRole(user,['Trainer','System Admin']);
+        const body=await readBody(req);
+        const question=String(body.question??'').trim();
+        const competencyId=Number(body.competencyId);
+        const options=Array.isArray(body.options)?body.options.map(x=>String(x).trim()):[];
+        const answer=Number(body.correctIndex);
+        const explanation=String(body.explanation??'').trim();
+        if(question.length<12||question.length>600||options.length<2||options.length>5||options.some(x=>!x||x.length>250)||new Set(options).size!==options.length||!Number.isInteger(answer)||answer<0||answer>=options.length||explanation.length<8||!await db.prepare('SELECT 1 FROM competencies WHERE id=?').get(competencyId)) throw err(400,'Question needs clear text, 2–5 unique options, a valid answer, an explanation, and a known competency.');
+        const result=await db.prepare("INSERT INTO assessment_questions(competency_id,question,options_json,correct_index,explanation,status,is_synthetic) VALUES (?,?,?,?,?,'draft',0)").run(competencyId,question,JSON.stringify(options),answer,explanation);
+        await audit(db,user.id,'question_drafted','assessment_question',result.lastInsertRowid,{competencyId});
+        return json(res,201,{id:Number(result.lastInsertRowid),status:'draft'});
+      }
+      if(req.method==='POST'&&path==='/api/trainer/questions/generate') {
+        checkOrigin(req);requireRole(user,['Trainer','System Admin']);
+        const body=await readBody(req);const generated=await generateQuestionFromSource(db,Number(body.competencyId));
+        const result=await db.prepare("INSERT INTO assessment_questions(competency_id,question,options_json,correct_index,explanation,source_id,status,is_synthetic) VALUES (?,?,?,?,?,?,\'draft\',0)")
+          .run(generated.competency.id,generated.item.question,JSON.stringify(generated.item.options),generated.item.correctIndex,generated.item.explanation,generated.source.resource_id);
+        await audit(db,user.id,'question_generated','assessment_question',result.lastInsertRowid,{competencyId:generated.competency.id,provider:generated.provider,source:generated.source.title});
+        return json(res,201,{id:Number(result.lastInsertRowid),status:'draft',provider:generated.provider,source:generated.source.title,question:generated.item.question});
+      }
+      if(req.method==='PATCH'&&/^\/api\/trainer\/questions\/\d+\/review$/.test(path)) {
+        checkOrigin(req);requireRole(user,['Trainer','System Admin']);
+        const questionId=Number(path.split('/')[4]);
+        const body=await readBody(req);
+        if(!['published','rejected'].includes(body.status)) throw err(400,'Review status must be published or rejected.');
+        const changed=await db.prepare("UPDATE assessment_questions SET status=? WHERE id=? AND status='draft'").run(body.status,questionId);
+        if(!changed.changes) throw err(404,'Draft question was not found.');
+        await audit(db,user.id,'question_reviewed','assessment_question',questionId,{status:body.status});
+        if(body.status==='published'){
+          const question=await db.prepare('SELECT competency_id FROM assessment_questions WHERE id=?').get(questionId);
+          for(const learner of await db.prepare("SELECT uc.user_id FROM user_competencies uc JOIN users u ON u.id=uc.user_id WHERE uc.competency_id=? AND u.role_id=(SELECT id FROM roles WHERE name='Learner') AND u.deleted_at IS NULL").all(question.competency_id))await notifyUser(db,learner.user_id,'New trainer-reviewed assessment question','A reviewed question is now available in the competency assessment bank.','trainer_feedback');
+        }
+        return json(res,200,{id:questionId,status:body.status});
+      }
+      if(req.method==='GET'&&path==='/api/admin/framework') {
+        requireRole(user,['System Admin']);
+        return json(res,200,{
+          categories:await db.prepare('SELECT id,name FROM competency_categories ORDER BY name').all(),
+          competencies:await db.prepare('SELECT c.id,c.name,c.description,c.active,cat.name category FROM competencies c JOIN competency_categories cat ON cat.id=c.category_id ORDER BY cat.name,c.name').all(),
+          roles:await db.prepare('SELECT id,name,description FROM job_roles ORDER BY name').all(),
+          learners:await db.prepare(`SELECT u.id,u.name,u.email,u.job_role_id jobRoleId,COALESCE(j.name,'Unassigned') jobRole FROM users u
+            LEFT JOIN job_roles j ON j.id=u.job_role_id WHERE u.role_id=(SELECT id FROM roles WHERE name='Learner') AND u.deleted_at IS NULL ORDER BY u.name`).all(),
+          mappings:await db.prepare(`SELECT jc.job_role_id jobRoleId,jc.competency_id competencyId,jc.required_level requiredLevel,jc.priority,r.name roleName,c.name competencyName
+            FROM job_role_competencies jc JOIN job_roles r ON r.id=jc.job_role_id JOIN competencies c ON c.id=jc.competency_id
+            ORDER BY r.name,c.name`).all(),
+          levels:await db.prepare('SELECT level,label FROM competency_levels ORDER BY level').all(),
+        });
+      }
+      if(req.method==='GET'&&path==='/api/admin/users') {
+        requireRole(user,['System Admin']);
+        const items=await db.prepare(`SELECT u.id,u.name,u.email,r.name role,d.name department,j.name jobRole,u.created_at createdAt
+          FROM users u JOIN roles r ON r.id=u.role_id LEFT JOIN departments d ON d.id=u.department_id
+          LEFT JOIN job_roles j ON j.id=u.job_role_id WHERE u.deleted_at IS NULL ORDER BY u.name`).all();
+        return json(res,200,{items});
+      }
+      if(req.method==='POST'&&path==='/api/admin/users') {
+        checkOrigin(req);requireRole(user,['System Admin']);
+        const body=await readBody(req);const name=String(body.name??'').trim();const email=String(body.email??'').trim().toLowerCase();const password=String(body.password??'');
+        const roleName=String(body.role??'Learner');
+        if(name.length<2||name.length>100||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||email.length>254)throw err(400,'Provide a valid name and email address.');
+        if(password.length<10||password.length>128)throw err(400,'Password must contain 10 to 128 characters.');
+        if(!['Learner','Trainer','Department Admin'].includes(roleName))throw err(400,'New accounts can be Learner, Trainer, or Department Admin.');
+        if(await db.prepare('SELECT 1 FROM users WHERE email=?').get(email))throw err(409,'An account with this email already exists.');
+        const role=await db.prepare('SELECT id FROM roles WHERE name=?').get(roleName);
+        const department=body.departmentId?await db.prepare('SELECT id FROM departments WHERE id=?').get(Number(body.departmentId)):await db.prepare('SELECT id FROM departments WHERE name=?').get(process.env.DEFAULT_DEPARTMENT||'General');
+        const organization=body.organizationId?await db.prepare('SELECT id FROM organizations WHERE id=?').get(Number(body.organizationId)):await db.prepare('SELECT id FROM organizations WHERE name=?').get(process.env.DEFAULT_ORGANIZATION||'My Organization');
+        const jobRole=body.jobRoleId?await db.prepare('SELECT id FROM job_roles WHERE id=?').get(Number(body.jobRoleId)):await db.prepare('SELECT id FROM job_roles WHERE name=?').get(process.env.DEFAULT_JOB_ROLE||'Statistical Data Analyst');
+        if(!role||!department||!organization||!jobRole)throw err(400,'Choose valid role, department, organization, and job role values.');
+        const created=await db.prepare(`INSERT INTO users(name,email,password_hash,role_id,department_id,organization_id,job_role_id,designation,is_synthetic)
+          VALUES (?,?,?,?,?,?,?,'',0)`).run(name,email,hashPassword(password),role.id,department.id,organization.id,jobRole.id);
+        const userId=Number(created.lastInsertRowid);
+        await db.prepare('INSERT INTO user_roles(user_id,role_id) VALUES (?,?)').run(userId,role.id);
+        await db.prepare('INSERT INTO user_competencies(user_id,competency_id,self_level,assessment_level,current_level,confidence) SELECT ?,id,0,NULL,0,0.35 FROM competencies WHERE active=1').run(userId);
+        await saveGaps(db,userId);await audit(db,user.id,'account_created','user',userId,{role:roleName});
+        return json(res,201,{id:userId,name,email,role:roleName});
+      }
+      if(req.method==='POST'&&path==='/api/admin/courses') {
+        checkOrigin(req);requireRole(user,['System Admin']);
+        const body=await readBody(req);const title=String(body.title??'').trim();const description=String(body.description??body.summary??'').trim();
+        const provider=String(body.provider??'Internal').trim();const providerType=String(body.providerType??'Internal').trim();
+        const difficulty=String(body.difficulty??'Beginner');const language=String(body.language??'English');const hours=Number(body.durationHours);
+        const mappings=Array.isArray(body.competencies)?body.competencies:[];
+        if(title.length<3||title.length>200||description.length<8||description.length>3000||!provider||!providerType||!Number.isFinite(hours)||hours<=0||hours>1000)throw err(400,'Provide a title, description, provider, course type, and duration from 0.1 to 1,000 hours.');
+        if(!['Beginner','Intermediate','Advanced'].includes(difficulty)||language.length>60||mappings.length<1||mappings.length>50)throw err(400,'Choose a valid difficulty, language, and at least one competency.');
+        const competencyIds=[...new Set(mappings.map(mapping=>Number(mapping.competencyId)))];
+        if(competencyIds.length!==mappings.length)throw err(400,'Each competency may be mapped only once.');
+        for(const mapping of mappings){if(!Number.isInteger(Number(mapping.targetLevel))||Number(mapping.targetLevel)<0||Number(mapping.targetLevel)>5||!await db.prepare('SELECT 1 FROM competencies WHERE id=? AND active=1').get(Number(mapping.competencyId)))throw err(400,'Every course competency must exist and have a target level from 0 to 5.');}
+        let courseId;
+        await db.transaction(async tx=>{
+          const created=await tx.prepare('INSERT INTO courses(title,description,provider,provider_type,duration_hours,difficulty,language,is_synthetic) VALUES (?,?,?,?,?,?,?,0)').run(title,description,provider,providerType,hours,difficulty,language);
+          courseId=Number(created.lastInsertRowid);
+          for(const mapping of mappings)await tx.prepare('INSERT INTO course_competencies(course_id,competency_id,target_level) VALUES (?,?,?)').run(courseId,Number(mapping.competencyId),Number(mapping.targetLevel));
+          for(const prerequisiteId of [...new Set((body.prerequisites??[]).map(Number))]){
+            if(prerequisiteId===courseId||!await tx.prepare('SELECT 1 FROM courses WHERE id=? AND active=1').get(prerequisiteId))throw err(400,'A prerequisite course was not found.');
+            await tx.prepare('INSERT INTO course_prerequisites(course_id,prerequisite_course_id) VALUES (?,?)').run(courseId,prerequisiteId);
+          }
+          await audit(tx,user.id,'course_created','course',courseId,{title});
+        });
+        return json(res,201,{id:courseId,title,description,provider,providerType,durationHours:hours,difficulty,language,competencies:mappings});
+      }
+      if(req.method==='POST'&&path==='/api/admin/competencies') {
+        checkOrigin(req);requireRole(user,['System Admin']);
+        const body=await readBody(req);const name=String(body.name??'').trim();const description=String(body.description??'').trim();const category=String(body.category??'').trim();
+        if(name.length<2||name.length>100||description.length<8||description.length>1000||category.length<2||category.length>80)throw err(400,'Provide a competency name, description, and category within the stated length limits.');
+        if(await db.prepare('SELECT 1 FROM competencies WHERE name=?').get(name))throw err(409,'A competency with this name already exists.');
+        let competencyId;
+        await db.transaction(async tx=>{
+          await tx.prepare('INSERT OR IGNORE INTO competency_categories(name) VALUES (?)').run(category);
+          const categoryId=(await tx.prepare('SELECT id FROM competency_categories WHERE name=?').get(category)).id;
+          const created=await tx.prepare('INSERT INTO competencies(category_id,name,description) VALUES (?,?,?)').run(categoryId,name,description);
+          competencyId=Number(created.lastInsertRowid);
+          await tx.prepare('INSERT INTO user_competencies(user_id,competency_id,self_level,current_level,confidence) SELECT id,?,0,0,0.35 FROM users WHERE deleted_at IS NULL').run(competencyId);
+          await audit(tx,user.id,'competency_created','competency',competencyId,{name,category});
+        });
+        return json(res,201,{id:competencyId,name,description,category});
+      }
+      if(req.method==='POST'&&path==='/api/admin/job-roles') {
+        checkOrigin(req);requireRole(user,['System Admin']);
+        const body=await readBody(req);const name=String(body.name??'').trim();const description=String(body.description??'').trim();
+        if(name.length<2||name.length>120||description.length<8||description.length>1000)throw err(400,'Provide a job role name and description within the stated length limits.');
+        if(await db.prepare('SELECT 1 FROM job_roles WHERE name=?').get(name))throw err(409,'A job role with this name already exists.');
+        const created=await db.prepare('INSERT INTO job_roles(name,description,is_synthetic) VALUES (?,?,0)').run(name,description);
+        const id=Number(created.lastInsertRowid);await audit(db,user.id,'job_role_created','job_role',id,{name});
+        return json(res,201,{id,name,description});
+      }
+      if(req.method==='PATCH'&&/^\/api\/admin\/users\/\d+\/job-role$/.test(path)) {
+        checkOrigin(req);requireRole(user,['System Admin']);
+        const targetId=Number(path.split('/')[4]);const body=await readBody(req);const roleId=Number(body.jobRoleId);
+        const learner=await db.prepare("SELECT id FROM users WHERE id=? AND role_id=(SELECT id FROM roles WHERE name='Learner') AND deleted_at IS NULL").get(targetId);
+        if(!learner)throw err(404,'Learner was not found.');
+        const jobRole=await db.prepare('SELECT id,name FROM job_roles WHERE id=?').get(roleId);
+        if(!jobRole)throw err(404,'Job role was not found.');
+        await db.prepare('UPDATE users SET job_role_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=?').run(roleId,targetId);
+        await saveGaps(db,targetId);await audit(db,user.id,'learner_job_role_updated','user',targetId,{jobRoleId:roleId,jobRole:jobRole.name});
+        await notifyUser(db,targetId,'Job role updated',`Your role is now ${jobRole.name}. Competency gaps and recommendations were recalculated.`,'skill_gap');
+        return json(res,200,{userId:targetId,jobRoleId:roleId,jobRole:jobRole.name});
+      }
+      if(req.method==='POST'&&/^\/api\/admin\/job-roles\/\d+\/competencies$/.test(path)) {
+        checkOrigin(req);requireRole(user,['System Admin']);
+        const roleId=Number(path.split('/')[4]);const body=await readBody(req);const competencyId=Number(body.competencyId);const requiredLevel=Number(body.requiredLevel);const priority=String(body.priority??'Medium');
+        if(!await db.prepare('SELECT 1 FROM job_roles WHERE id=?').get(roleId))throw err(404,'Job role was not found.');
+        if(!await db.prepare('SELECT 1 FROM competencies WHERE id=? AND active=1').get(competencyId))throw err(404,'Competency was not found.');
+        if(!Number.isInteger(requiredLevel)||requiredLevel<0||requiredLevel>5||!['Low','Medium','High','Critical'].includes(priority))throw err(400,'Required level must be 0–5 and priority must be Low, Medium, High, or Critical.');
+        await db.prepare(`INSERT INTO job_role_competencies(job_role_id,competency_id,required_level,priority) VALUES (?,?,?,?)
+          ON CONFLICT(job_role_id,competency_id) DO UPDATE SET required_level=excluded.required_level,priority=excluded.priority`).run(roleId,competencyId,requiredLevel,priority);
+        for(const learner of await db.prepare('SELECT id FROM users WHERE job_role_id=? AND deleted_at IS NULL').all(roleId))await saveGaps(db,learner.id);
+        await audit(db,user.id,'job_role_competency_mapped','job_role',roleId,{competencyId,requiredLevel,priority});
+        return json(res,200,{jobRoleId:roleId,competencyId,requiredLevel,priority});
+      }
+      if(req.method==='GET'&&path==='/api/admin/analytics') {
+        requireRole(user,['Department Admin','System Admin']);
+        return json(res,200,await analytics(db));
+      }
+      if(req.method==='GET'&&path==='/api/admin/predictions') {
+        requireRole(user,['Department Admin','System Admin']);
+        return json(res,200,await predictiveScenario(db));
+      }
+      if(req.method==='GET'&&path==='/api/admin/audit') {
+        requireRole(user,['System Admin']);
+        return json(res,200,{items:await db.prepare(`SELECT a.action,a.entity_type entityType,a.entity_id entityId,a.created_at createdAt,u.name userName FROM audit_logs a LEFT JOIN users u ON u.id=a.user_id ORDER BY a.id DESC LIMIT 100`).all()});
+      }
+      if(!path.startsWith('/api/')&&['GET','HEAD'].includes(req.method)) {
+        const root=resolve('dist');
+        const candidate=resolve(root,`.${path==='/ '||path==='/'?'/index.html':path}`);
+        const relativePath=relative(root,candidate);
+        const safe=relativePath===''||(!relativePath.startsWith('..')&&!isAbsolute(relativePath));
+        if(safe) {
+          try {
+            const filePath=(await readFile(candidate)).length>=0?candidate:resolve(root,'index.html');
+            const body=await readFile(filePath);
+            const types={'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.svg':'image/svg+xml','.png':'image/png','.ico':'image/x-icon','.json':'application/json; charset=utf-8'};
+            res.writeHead(200,{'content-type':types[extname(filePath)]??'application/octet-stream','content-length':body.length,'cache-control':extname(filePath)==='.html'?'no-cache':'public, max-age=31536000, immutable'});
+            return res.end(req.method==='HEAD'?undefined:body);
+          } catch {
+            try { const body=await readFile(resolve(root,'index.html'));res.writeHead(200,{'content-type':'text/html; charset=utf-8','cache-control':'no-cache'});return res.end(req.method==='HEAD'?undefined:body); } catch {}
+          }
+        }
+      }
+      return json(res,404,{error:'Endpoint not found.'});
+    } catch (error) {
+      const status=Number(error.status)||500;
+      if(status>=500) console.error(error);
+      return json(res,status,{error:status>=500?'The request could not be completed.':error.message});
+    }
+  });
+  return server;
+}
