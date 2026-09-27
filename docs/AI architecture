@@ -1,0 +1,15 @@
+# AI architecture
+
+The assistant and source-question workflow are isolated behind service functions in `server/app.js`. `AI_PROVIDER=demo` is the default. In this mode the app ranks chunks with lexical overlap, selects relevant sentences, returns an extractive answer, and attaches local source titles and page references. It does not call a language model.
+
+When configured, `AI_PROVIDER=ollama` uses Ollama's chat and embedding endpoints. Other non-demo providers are treated as OpenAI-compatible: `AI_BASE_URL` is the API base, `AI_MODEL` is the chat model, `AI_EMBEDDING_MODEL` is optional, and `AI_API_KEY` is sent as a bearer token. Provider errors fall back to grounded local behavior for chat; embedding errors fall back to lexical ranking. Do not put production secrets in source control.
+
+## Retrieval behavior
+
+- Documents are extracted to plain text and split into bounded overlapping chunks.
+- A configured embedding model may produce vectors, serialized as JSON in PostgreSQL.
+- Query vectors are ranked by cosine similarity when available; otherwise token overlap and a topic phrase bonus rank candidate chunks.
+- Only retrieved passages are supplied to the generation function. The final response includes source metadata; without suitable evidence, the assistant declines to answer from the corpus.
+- Generated assessment questions use a relevant source passage and are inserted as drafts. Trainer review is required before publication.
+
+See [RAG flow](rag.md) for pipeline details. This is not a production-grade model governance system: no offline evaluation suite, adversarial prompt testing, provider data-processing agreement, retrieval service, or approved authoritative corpus is bundled.
