@@ -1,0 +1,247 @@
+import test, { before, after } from 'node:test';
+import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import pg from 'pg';
+import { initDatabase } from '../server/database.js';
+import { createAppServer } from '../server/app.js';
+
+const { Pool } = pg;
+const testDatabaseUrl = process.env.TEST_DATABASE_URL;
+const testSchema = `statlearn_test_${randomUUID().replaceAll('-', '')}`;
+let db, server, base;
+
+before(async () => {
+  if(!testDatabaseUrl)throw new Error('Set TEST_DATABASE_URL to a disposable PostgreSQL database before running npm test.');
+  db=await initDatabase({connectionString:testDatabaseUrl,seedDemo:true,schemaName:testSchema,resetSchema:true});
+  server=createAppServer({db});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  base=`http://127.0.0.1:${server.address().port}`;
+});
+
+after(async () => {
+  if(server) await new Promise(resolve=>server.close(resolve));
+  await db?.close();
+  if(testDatabaseUrl){
+    const adminPool=new Pool({connectionString:testDatabaseUrl});
+    try{await adminPool.query(`DROP SCHEMA IF EXISTS "${testSchema}" CASCADE`);}finally{await adminPool.end();}
+  }
+});
+
+async function request(path,{method='GET',body,cookie}={}) {
+  const response=await fetch(`${base}/api${path}`,{method,headers:{...(body?{'content-type':'application/json'}:{}),...(cookie?{cookie}:{})},body:body?JSON.stringify(body):undefined});
+  return {response,payload:await response.json().catch(()=>({}))};
+}
+
+async function upload(path,cookie,fileName,content,competencyId){
+  const response=await fetch(`${base}/api${path}`,{method:'POST',headers:{cookie,'content-type':'application/octet-stream','x-document-name':encodeURIComponent(fileName),'x-competency-id':String(competencyId),'x-language':'English'},body:content});
+  return {response,payload:await response.json().catch(()=>({}))};
+}
+
+function tinyPdf(text){
+  const content=`BT /F1 12 Tf 72 720 Td (${text}) Tj ET`;
+  const objects=[
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>',
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+    `<< /Length ${Buffer.byteLength(content)} >>\nstream\n${content}\nendstream`,
+  ];
+  let pdf='%PDF-1.4\n';const offsets=[0];
+  objects.forEach((object,index)=>{offsets.push(Buffer.byteLength(pdf));pdf+=`${index+1} 0 obj\n${object}\nendobj\n`;});
+  const xref=Buffer.byteLength(pdf);pdf+=`xref\n0 ${objects.length+1}\n0000000000 65535 f \n`;
+  for(const offset of offsets.slice(1))pdf+=`${String(offset).padStart(10,'0')} 00000 n \n`;
+  pdf+=`trailer\n<< /Size ${objects.length+1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`;
+  return Buffer.from(pdf);
+}
+
+async function login(email='learner@demo.gov.in') {
+  const {response,payload}=await request('/auth/login',{method:'POST',body:{email,password:'learn1234'}});
+  assert.equal(response.status,200,JSON.stringify(payload));
+  return {cookie:response.headers.get('set-cookie').split(';')[0],user:payload.user};
+}
+
+test('health and readiness work without authentication; private routes require a session',async()=>{
+  const health=await request('/health');
+  assert.equal(health.payload.status,'ok');
+  const ready=await request('/ready');
+  assert.equal(ready.payload.status,'ready');
+  const privateRoute=await request('/dashboard');
+  assert.equal(privateRoute.response.status,401);
+});
+
+test('database demo seeding does not duplicate the starter notifications on restart',async()=>{
+  const firstCount=(await db.prepare('SELECT COUNT(*) count FROM notifications').get()).count;
+  const second=await initDatabase({connectionString:testDatabaseUrl,seedDemo:true,schemaName:testSchema});
+  await second.close();
+  const secondCount=(await db.prepare('SELECT COUNT(*) count FROM notifications').get()).count;
+  assert.equal(firstCount,3);
+  assert.equal(secondCount,firstCount);
+});
+
+test('built production app serves the SPA entry point for nested routes',{skip:!existsSync(new URL('../dist/index.html',import.meta.url))},async()=>{
+  for(const path of ['/','/learner/competencies']){
+    const response=await fetch(`${base}${path}`);
+    assert.equal(response.status,200);
+    assert.ok((response.headers.get('content-type')??'').includes('text/html'));
+    assert.match(await response.text(),/<div id="root"><\/div>/);
+  }
+});
+
+test('learner can assess, update evidence, recalculate gaps, receive recommendations, and complete learning',async()=>{
+  const session=await login();
+  assert.equal(session.user.role,'Learner');
+  const before=(await request('/dashboard',{cookie:session.cookie})).payload;
+  const path=(await request('/learning/path',{cookie:session.cookie})).payload.items;
+  const foundationIndex=path.findIndex(item=>item.title==='Foundations of Survey Design');
+  const samplingIndex=path.findIndex(item=>item.title==='Sampling Methods and Estimation');
+  if(samplingIndex>=0)assert.ok(foundationIndex>=0&&foundationIndex<samplingIndex,'prerequisite appears before the dependent course');
+  const start=await request('/assessment/start',{method:'POST',cookie:session.cookie,body:{}});
+  assert.equal(start.response.status,201);
+  const answers={};
+  for(const q of start.payload.questions){
+    const text=q.question.toLowerCase();
+    answers[q.id]=text.includes('pilot')||text.includes('target population')||text.includes('probability sample')||text.includes('metadata')||text.includes('check before')||text.includes('privacy')||text.includes('chart')?1:text.includes('design weight')||text.includes('joining two')?0:1;
+  }
+  const submitted=await request(`/assessment/${start.payload.attemptId}/submit`,{method:'POST',cookie:session.cookie,body:{answers}});
+  assert.equal(submitted.response.status,200,JSON.stringify(submitted.payload));
+  assert.equal(submitted.payload.percentage,100);
+  assert.ok(submitted.payload.updatedCompetencies.length>0);
+  const after=(await request('/dashboard',{cookie:session.cookie})).payload;
+  assert.ok(after.readiness>=before.readiness);
+  assert.ok(submitted.payload.skillGaps.length<before.priorityGaps.length||submitted.payload.updatedCompetencies.some(c=>c.gap<before.competencies.find(b=>b.id===c.id).gap));
+  assert.ok(submitted.payload.recommendations.length>0);
+  const notices=await request('/notifications',{cookie:session.cookie});
+  assert.ok(notices.payload.items.some(item=>item.kind==='assessment'));
+  const unread=notices.payload.items.find(item=>!item.readAt);
+  assert.ok(unread);
+  const marked=await request(`/notifications/${unread.id}/read`,{method:'PATCH',cookie:session.cookie,body:{}});
+  assert.equal(marked.response.status,200);
+  const repeat=await request(`/assessment/${start.payload.attemptId}/submit`,{method:'POST',cookie:session.cookie,body:{answers}});
+  assert.equal(repeat.response.status,409);
+
+  const library=await request('/catalog',{cookie:session.cookie});
+  const python=library.payload.items.find(course=>course.title==='Python for Official Statistics');
+  assert.ok(python);
+  const enrolled=await request(`/courses/${python.id}/enroll`,{method:'POST',cookie:session.cookie,body:{}});
+  assert.equal(enrolled.response.status,200);
+  const completed=await request(`/courses/${python.id}/complete`,{method:'POST',cookie:session.cookie,body:{}});
+  assert.equal(completed.response.status,200);
+  const profile=(await request('/competencies',{cookie:session.cookie})).payload.items.find(c=>c.name==='Python');
+  assert.ok(profile.currentLevel>=2);
+});
+
+test('assistant returns citations for retrieved material and refuses unsupported topics',async()=>{
+  const session=await login();
+  const grounded=await request('/assistant/chat',{method:'POST',cookie:session.cookie,body:{message:'How do I choose a sampling method?'}});
+  assert.equal(grounded.response.status,200);
+  assert.equal(grounded.payload.grounded,true);
+  assert.ok(grounded.payload.sources.some(source=>source.competency==='Sampling'));
+  const unknown=await request('/assistant/chat',{method:'POST',cookie:session.cookie,body:{message:'Explain quantum submarine management policies'}});
+  assert.equal(unknown.payload.answer,'I could not find this information in the available learning sources.');
+  assert.equal(unknown.payload.grounded,false);
+});
+
+test('trainer can upload PDF and text sources, build RAG chunks, and draft a cited question',async()=>{
+  const trainer=await login('trainer@demo.gov.in');
+  const sampling=(await request('/competencies',{cookie:trainer.cookie})).payload.items.find(c=>c.name==='Sampling');
+  const pdf=await upload('/resources/upload',trainer.cookie,'Sampling note.pdf',tinyPdf('A probability sample gives each unit a known non-zero chance of selection.'),sampling.id);
+  assert.equal(pdf.response.status,201,JSON.stringify(pdf.payload));
+  assert.ok(pdf.payload.chunkCount>=1);
+  assert.equal(pdf.payload.synthetic,false);
+  const txt=await upload('/resources/upload',trainer.cookie,'Survey operations.txt',Buffer.from('Document the target population, reference period, and measurable survey concepts before field work.'),sampling.id);
+  assert.equal(txt.response.status,201,JSON.stringify(txt.payload));
+  const duplicate=await upload('/resources/upload',trainer.cookie,'Copy.txt',Buffer.from('Document the target population, reference period, and measurable survey concepts before field work.'),sampling.id);
+  assert.equal(duplicate.response.status,409);
+  const oldPowerPoint=await upload('/resources/upload',trainer.cookie,'Slides.ppt',Buffer.from('legacy'),sampling.id);
+  assert.equal(oldPowerPoint.response.status,415);
+
+  const learner=await login();
+  const answer=await request('/assistant/chat',{method:'POST',cookie:learner.cookie,body:{message:'How does a probability sample select units?'}});
+  assert.equal(answer.response.status,200);
+  assert.ok(answer.payload.sources.some(source=>source.title.includes('Sampling note.pdf')));
+  assert.ok(answer.payload.sources[0].page);
+
+  const generated=await request('/trainer/questions/generate',{method:'POST',cookie:trainer.cookie,body:{competencyId:sampling.id}});
+  assert.equal(generated.response.status,201,JSON.stringify(generated.payload));
+  assert.equal(generated.payload.status,'draft');
+  const review=await request(`/trainer/questions/${generated.payload.id}/review`,{method:'PATCH',cookie:trainer.cookie,body:{status:'published'}});
+  assert.equal(review.payload.status,'published');
+});
+
+test('trainer drafts remain unpublished until reviewed; learner cannot access admin analytics',async()=>{
+  const trainer=await login('trainer@demo.gov.in');
+  const comps=(await request('/competencies',{cookie:trainer.cookie})).payload.items;
+  const draft=await request('/trainer/questions',{method:'POST',cookie:trainer.cookie,body:{competencyId:comps[0].id,question:'Which practice helps improve a survey instrument before deployment?',options:['Pilot the questionnaire','Skip pretesting'],correctIndex:0,explanation:'A pilot helps identify confusing questions before a full survey.'}});
+  assert.equal(draft.response.status,201,JSON.stringify(draft.payload));
+  const reviewed=await request(`/trainer/questions/${draft.payload.id}/review`,{method:'PATCH',cookie:trainer.cookie,body:{status:'published'}});
+  assert.equal(reviewed.payload.status,'published');
+
+  const learner=await login();
+  const denied=await request('/admin/analytics',{cookie:learner.cookie});
+  assert.equal(denied.response.status,403);
+});
+
+test('system admin sees database-backed synthetic analytics and audit events',async()=>{
+  const admin=await login('admin@demo.gov.in');
+  const analytics=await request('/admin/analytics',{cookie:admin.cookie});
+  assert.equal(analytics.response.status,200);
+  assert.equal(analytics.payload.synthetic,true);
+  assert.ok(analytics.payload.officials>=8);
+  assert.ok(Array.isArray(analytics.payload.topGaps));
+  const audit=await request('/admin/audit',{cookie:admin.cookie});
+  assert.equal(audit.response.status,200);
+  assert.ok(audit.payload.items.some(row=>row.action==='login'));
+  const predictions=await request('/admin/predictions',{cookie:admin.cookie});
+  assert.equal(predictions.payload.mode,'demo-scenario');
+  assert.equal(predictions.payload.synthetic,true);
+  assert.match(predictions.payload.method,/not a time-series forecast/i);
+  assert.ok(predictions.payload.items.length>0);
+});
+
+test('system admin can extend competency and job-role requirements while learners remain blocked',async()=>{
+  const admin=await login('admin@demo.gov.in');
+  const initial=await request('/admin/framework',{cookie:admin.cookie});
+  assert.equal(initial.response.status,200);
+  assert.ok(initial.payload.competencies.length>=30);
+  const learner=await login();
+  const denied=await request('/admin/framework',{cookie:learner.cookie});
+  assert.equal(denied.response.status,403);
+  const competency=await request('/admin/competencies',{method:'POST',cookie:admin.cookie,body:{name:'Synthetic test competency',category:'Demo category',description:'A test-only competency for framework administration.'}});
+  assert.equal(competency.response.status,201,JSON.stringify(competency.payload));
+  const role=await request('/admin/job-roles',{method:'POST',cookie:admin.cookie,body:{name:'Synthetic test role',description:'A test-only role for competency mapping.'}});
+  assert.equal(role.response.status,201,JSON.stringify(role.payload));
+  const mapping=await request(`/admin/job-roles/${role.payload.id}/competencies`,{method:'POST',cookie:admin.cookie,body:{competencyId:competency.payload.id,requiredLevel:4,priority:'High'}});
+  assert.equal(mapping.response.status,200,JSON.stringify(mapping.payload));
+  const deniedAssignment=await request(`/admin/users/${learner.user.id}/job-role`,{method:'PATCH',cookie:learner.cookie,body:{jobRoleId:role.payload.id}});
+  assert.equal(deniedAssignment.response.status,403);
+  const assignment=await request(`/admin/users/${learner.user.id}/job-role`,{method:'PATCH',cookie:admin.cookie,body:{jobRoleId:role.payload.id}});
+  assert.equal(assignment.response.status,200,JSON.stringify(assignment.payload));
+  const learnerProfile=await request('/profile',{cookie:learner.cookie});
+  assert.equal(learnerProfile.payload.jobRole,'Synthetic test role');
+  const updated=await request('/admin/framework',{cookie:admin.cookie});
+  assert.ok(updated.payload.mappings.some(item=>item.roleName==='Synthetic test role'&&item.competencyName==='Synthetic test competency'&&item.requiredLevel===4));
+});
+
+test('profile validation and role-based update work',async()=>{
+  const session=await login();
+  const invalid=await request('/profile',{method:'PATCH',cookie:session.cookie,body:{experienceYears:100}});
+  assert.equal(invalid.response.status,400);
+  const saved=await request('/profile',{method:'PATCH',cookie:session.cookie,body:{currentAssignment:'Synthetic demo assignment'}});
+  assert.equal(saved.response.status,200);
+  assert.equal(saved.payload.currentAssignment,'Synthetic demo assignment');
+});
+
+test('learner can create a demo account with a hashed password and default competencies',async()=>{
+  const created=await request('/auth/register',{method:'POST',body:{name:'New Demo Learner',email:'new.learner@example.invalid',password:'secure-demo-2026'}});
+  assert.equal(created.response.status,201,JSON.stringify(created.payload));
+  assert.equal(created.payload.user.role,'Learner');
+  const cookie=created.response.headers.get('set-cookie').split(';')[0];
+  const profile=await request('/profile',{cookie});
+  assert.equal(profile.payload.name,'New Demo Learner');
+  const framework=await request('/competencies',{cookie});
+  assert.ok(framework.payload.items.length>=10);
+  assert.ok(framework.payload.items.every(item=>item.currentLevel===0));
+  const duplicate=await request('/auth/register',{method:'POST',body:{name:'New Demo Learner',email:'new.learner@example.invalid',password:'secure-demo-2026'}});
+  assert.equal(duplicate.response.status,409);
+});
