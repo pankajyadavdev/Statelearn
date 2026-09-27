@@ -1,0 +1,20 @@
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+const root = fileURLToPath(new URL('..', import.meta.url));
+const node = process.execPath;
+const jobs = [
+  { name: 'api', args: [fileURLToPath(new URL('../server/index.js', import.meta.url))], env: { ...process.env, PORT: '3001' } },
+  { name: 'vite', args: [fileURLToPath(new URL('../node_modules/vite/bin/vite.js', import.meta.url)), '--host', '127.0.0.1'], env: process.env },
+];
+const children = jobs.map(job => {
+  const child = spawn(node, job.args, { cwd: root, env: job.env, stdio: 'inherit' });
+  child.on('exit', code => {
+    if (code && code !== 0) process.exitCode = code;
+    for (const other of children) if (other !== child && !other.killed) other.kill();
+  });
+  return child;
+});
+for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => {
+  for (const child of children) if (!child.killed) child.kill(signal);
+});
