@@ -1,0 +1,380 @@
+/* Responsive layout refinements. Keep these after styles.css overrides. */
+
+html,
+body,
+#root {
+  min-height: 100%;
+  width: 100%;
+}
+
+body {
+  overflow-x: hidden;
+}
+
+.app-shell,
+.main-area,
+.content-wrap,
+.panel {
+  min-width: 0;
+}
+
+.nav-item {
+  min-width: 0;
+}
+
+@media (min-width: 721px) {
+  .app-shell,
+  .login-shell {
+    font-size: 14px;
+  }
+
+  .sidebar .demo-label,
+  .sidebar .nav-caption,
+  .sidebar .brand small,
+  .sidebar .side-note p,
+  .sidebar .profile-switch-copy span,
+  .sidebar .logout-btn,
+  .footer {
+    font-size: 11px;
+  }
+
+  .sidebar .nav-item {
+    font-size: 13px;
+  }
+
+  .sidebar .side-note strong,
+  .sidebar .profile-switch-copy strong {
+    font-size: 13px;
+  }
+
+  .topbar .breadcrumbs,
+  .topbar .breadcrumbs strong,
+  .topbar .topbar-provider {
+    font-size: 13px;
+  }
+
+  .content-wrap p {
+    font-size: 14px !important;
+    line-height: 1.5;
+  }
+
+  .content-wrap small,
+  .content-wrap span {
+    font-size: 12px !important;
+  }
+
+  .content-wrap button {
+    font-size: 13px !important;
+  }
+
+  .content-wrap input,
+  .content-wrap select,
+  .content-wrap textarea,
+  .content-wrap label {
+    font-size: 13px !important;
+  }
+
+  .content-wrap input,
+  .content-wrap select,
+  .content-wrap textarea {
+    font-size: 14px !important;
+  }
+
+  .content-wrap .badge {
+    min-height: 24px;
+    height: auto;
+    padding: 3px 8px;
+    font-size: 10px !important;
+  }
+
+  .content-wrap .kicker,
+  .content-wrap .nav-caption,
+  .content-wrap .section-title > span,
+  .content-wrap .panel-legend,
+  .content-wrap .scale-labels,
+  .content-wrap .assessment-progress-top span,
+  .content-wrap .table-head {
+    font-size: 11px;
+  }
+
+  .content-wrap .panel-head h3,
+  .content-wrap .assessment-bottom-grid .panel h3,
+  .content-wrap .assessment-aside h3,
+  .content-wrap .form-section-head h3 {
+    font-size: 17px;
+  }
+
+  .content-wrap .course-card-body h3,
+  .content-wrap .framework-form h4,
+  .content-wrap .framework-mappings h4 {
+    font-size: 15px;
+  }
+
+  .content-wrap .section-title h2,
+  .content-wrap .profile-hero h2,
+  .content-wrap .login-form-wrap h2 {
+    font-size: 21px;
+  }
+
+  .login-shell p {
+    font-size: 14px !important;
+    line-height: 1.5;
+  }
+
+  .login-shell .story-kicker,
+  .login-shell .story-flow div,
+  .login-shell .story-foot,
+  .login-shell .login-panel-top > span,
+  .login-shell .login-panel-foot,
+  .login-shell .privacy-note,
+  .login-shell .auth-mode-btn,
+  .login-shell .login-error {
+    font-size: 12px;
+  }
+
+  .login-shell .login-form > label {
+    font-size: 13px;
+  }
+
+  .login-shell .login-form input {
+    font-size: 15px;
+  }
+
+  .login-shell button {
+    font-size: 13px;
+  }
+
+  .login-shell .badge {
+    min-height: 24px;
+    height: auto;
+    font-size: 10px !important;
+  }
+}
+
+@media (min-width: 721px) and (max-width: 900px) {
+  .login-shell {
+    grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+  }
+
+  .login-story {
+    padding-right: 6%;
+    padding-left: 6%;
+  }
+}
+
+@media (max-width: 720px) {
+  .sidebar {
+    position: fixed;
+    inset: auto 0 0;
+    z-index: 25;
+    display: flex;
+    flex-direction: row;
+    align-items: stretch;
+    gap: 2px;
+    width: 100%;
+    height: auto;
+    max-height: calc(72px + env(safe-area-inset-bottom));
+    padding: 5px 7px calc(5px + env(safe-area-inset-bottom));
+    overflow-x: auto;
+    overflow-y: hidden;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+    background: rgba(255, 255, 255, 0.98);
+    border-top: 1px solid #e8ecee;
+    border-right: 0;
+    box-shadow: 0 -5px 20px rgba(25, 42, 54, 0.06);
+  }
+
+  .sidebar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .sidebar-brand,
+  .demo-label,
+  .side-note,
+  .sidebar-spacer,
+  .profile-switch {
+    display: none !important;
+  }
+
+  .nav-group {
+    display: contents;
+    margin: 0;
+  }
+
+  .nav-caption {
+    display: none;
+  }
+
+  .nav-item {
+    display: flex;
+    flex: 0 0 68px;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    width: 68px;
+    height: 58px;
+    margin: 0;
+    padding: 5px 3px;
+    border-radius: 8px;
+    white-space: nowrap;
+    font-size: 9px;
+  }
+
+  .nav-item span {
+    display: block !important;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-size: 9px;
+    line-height: 1.2;
+  }
+
+  .nav-item svg {
+    width: 17px;
+    height: 17px;
+  }
+
+  .nav-new {
+    display: none;
+  }
+
+  .sidebar > .logout-btn {
+    display: flex !important;
+    flex: 0 0 60px;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    min-height: 58px;
+    margin-left: 3px;
+    padding: 5px 3px;
+    border-top: 0;
+    border-left: 1px solid #edf0f1;
+    font-size: 9px;
+    white-space: nowrap;
+  }
+
+  .sidebar > .logout-btn svg {
+    width: 17px;
+    height: 17px;
+  }
+
+  .main-area {
+    min-height: 100dvh;
+    margin-left: 0;
+    padding-bottom: calc(76px + env(safe-area-inset-bottom));
+  }
+
+  .topbar {
+    gap: 8px;
+    padding-right: max(12px, env(safe-area-inset-right));
+    padding-left: max(12px, env(safe-area-inset-left));
+  }
+
+  .breadcrumbs {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .breadcrumbs strong {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .content-wrap {
+    width: 100%;
+    padding: 21px max(12px, env(safe-area-inset-right)) 25px max(12px, env(safe-area-inset-left));
+  }
+
+  .page-heading {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+  }
+
+  .heading-actions {
+    flex-wrap: wrap;
+  }
+
+  .dashboard-grid,
+  .dashboard-bottom,
+  .assessment-layout,
+  .assessment-bottom-grid,
+  .result-columns,
+  .analytics-grid,
+  .trainer-grid,
+  .assistant-layout,
+  .profile-form-grid,
+  .framework-admin-grid {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+
+  .profile-role-card {
+    min-width: 0;
+  }
+
+  .effectiveness-table {
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .table-head,
+  .effectiveness-row {
+    min-width: 420px;
+  }
+
+  .toast {
+    right: 12px;
+    bottom: calc(78px + env(safe-area-inset-bottom));
+    left: 12px;
+    width: auto;
+    max-width: none;
+  }
+}
+
+@media (max-width: 480px) {
+  .login-shell {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .login-story {
+    min-height: 0;
+    padding: 20px max(18px, env(safe-area-inset-left));
+  }
+
+  .story-copy {
+    margin-top: 30px;
+  }
+
+  .login-panel {
+    min-height: 0;
+    padding: 17px max(18px, env(safe-area-inset-right)) 14px max(18px, env(safe-area-inset-left));
+  }
+
+  .login-panel-top {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .login-form-wrap {
+    margin: 20px auto;
+  }
+
+  .trainer-metrics {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .trainer-metrics > div {
+    min-width: 0;
+  }
+
+  .page-heading h1 {
+    overflow-wrap: anywhere;
+  }
+}
