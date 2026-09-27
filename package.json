@@ -1,0 +1,28 @@
+{
+  "name": "statlearn-capacity-platform",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --env-file-if-exists=.env scripts/dev.mjs",
+    "server": "node --env-file-if-exists=.env server/index.js",
+    "build": "vite build",
+    "typecheck": "tsc -p tsconfig.json",
+    "start": "node --env-file-if-exists=.env server/index.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "lucide-react": "latest",
+    "officeparser": "^8.0.0",
+    "pg": "^8.16.3",
+    "react": "latest",
+    "react-dom": "latest",
+    "vite": "latest"
+  },
+  "devDependencies": {
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "typescript": "latest"
+  }
+}
